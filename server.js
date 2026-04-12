@@ -1,19 +1,21 @@
-// Healing Streams Translation Server v1.0
 const { createClient, LiveTranscriptionEvents } = require("@deepgram/sdk");
 const Anthropic = require("@anthropic-ai/sdk");
 const { spawn }  = require("child_process");
 const WebSocket  = require("ws");
 const express    = require("express");
 const http       = require("http");
+const https      = require("https");
 const cors       = require("cors");
 const fs         = require("fs");
 const path       = require("path");
 
-const HLS_URL       = process.env.HLS_URL;
 const DEEPGRAM_KEY  = process.env.DEEPGRAM_KEY;
 const ANTHROPIC_KEY = process.env.ANTHROPIC_KEY;
 const PORT          = process.env.PORT || 3000;
 const RECORDINGS_DIR = "./recordings";
+
+// HLS_URL can be set via env or auto-detected
+let CURRENT_HLS_URL = process.env.HLS_URL || null;
 
 const TARGET_LANGUAGES = {
   es:"Spanish", fr:"French",  zh:"Chinese",    ar:"Arabic",
@@ -38,6 +40,73 @@ const wss       = new WebSocket.Server({ server });
 app.use(cors());
 app.use(express.json());
 app.use("/recordings", express.static(RECORDINGS_DIR));
+
+// ── Auto-detect HLS URL ───────────────────────────────────────
+async function fetchHLSUrl() {
+  return new Promise((resolve) => {
+    const options = {
+      hostname: 'healingstreams.tv',
+      path: '/live',
+      method: 'GET',
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      },
+      timeout: 10000
+    };
+
+    const req = https.request(options, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        // Look for m3u8 URL patterns in the page
+        const patterns = [
+          /https?:\/\/[^"'\s]+\.m3u8[^"'\s]*/g,
+          /src["']?\s*[:=]\s*["']([^"']+\.m3u8[^"']*)/g,
+          /file["']?\s*[:=]\s*["']([^"']+\.m3u8[^"']*)/g,
+          /hls["']?\s*[:=]\s*["']([^"']+\.m3u8[^"']*)/g,
+        ];
+
+        for (const pattern of patterns) {
+          const matches = data.match(pattern);
+          if (matches && matches.length > 0) {
+            const url = matches[0].replace(/["']/g, '').trim();
+            console.log(`🔍 Auto-detected HLS URL: ${url}`);
+            resolve(url);
+            return;
+          }
+        }
+        resolve(null);
+      });
+    });
+
+    req.on('error', () => resolve(null));
+    req.on('timeout', () => { req.destroy(); resolve(null); });
+    req.end();
+  });
+}
+
+async function getHLSUrl() {
+  // First try auto-detect
+  const detected = await fetchHLSUrl();
+  if (detected) {
+    CURRENT_HLS_URL = detected;
+    return detected;
+  }
+  // Fall back to env variable
+  if (CURRENT_HLS_URL) return CURRENT_HLS_URL;
+  return null;
+}
+
+// Auto-refresh HLS URL every 20 minutes
+setInterval(async () => {
+  console.log("🔄 Auto-refreshing HLS URL...");
+  const newUrl = await fetchHLSUrl();
+  if (newUrl && newUrl !== CURRENT_HLS_URL) {
+    console.log(`✅ HLS URL updated: ${newUrl}`);
+    CURRENT_HLS_URL = newUrl;
+  }
+}, 20 * 60 * 1000);
 
 // ── Session Recording ─────────────────────────────────────────
 let currentSession = null;
@@ -74,11 +143,9 @@ function recordSegment(transcript, translations, startTime, endTime) {
     startTime: startTime.toISOString(),
     endTime: endTime.toISOString(),
     durationSeconds: ((endTime - startTime) / 1000).toFixed(1),
-    transcript,
-    translations
+    transcript, translations
   };
   currentSession.segments.push(segment);
-
   fs.writeFileSync(currentSession.paths.json, JSON.stringify({
     session: currentSession.id,
     startTime: currentSession.startTime,
@@ -86,25 +153,18 @@ function recordSegment(transcript, translations, startTime, endTime) {
     languages: Object.keys(TARGET_LANGUAGES),
     segments: currentSession.segments
   }, null, 2));
-
   const langValues = Object.keys(TARGET_LANGUAGES).map(c => `"${(translations[c] || "").replace(/"/g, '""')}"`).join(",");
   fs.appendFileSync(currentSession.paths.csv, `${segment.index},"${segment.timestamp}","${segment.durationSeconds}s","${transcript.replace(/"/g, '""')}",${langValues}\n`);
-
   const srtStart = formatSRTTime(startTime);
   const srtEnd   = formatSRTTime(endTime);
   fs.appendFileSync(currentSession.paths.srt, `${currentSession.srtIndex}\n${srtStart} --> ${srtEnd}\n${transcript}\n\n`);
   currentSession.srtIndex++;
-
   fs.appendFileSync(currentSession.paths.txt, `[${startTime.toLocaleTimeString()}]\n${transcript}\n\n`);
   console.log(`📝 Recorded segment #${segment.index}`);
 }
 
 function formatSRTTime(date) {
-  const ms = date.getMilliseconds();
-  const s  = date.getSeconds();
-  const m  = date.getMinutes();
-  const h  = date.getHours();
-  return `${String(h).padStart(2,"0")}:${String(m).padStart(2,"0")}:${String(s).padStart(2,"0")},${String(ms).padStart(3,"0")}`;
+  return `${String(date.getHours()).padStart(2,"0")}:${String(date.getMinutes()).padStart(2,"0")}:${String(date.getSeconds()).padStart(2,"0")},${String(date.getMilliseconds()).padStart(3,"0")}`;
 }
 
 function endSession() {
@@ -130,7 +190,7 @@ wss.on("connection", (ws) => {
   console.log(`👁 Viewer connected. Total: ${viewers.size}`);
   if (global.latestTranslation) ws.send(JSON.stringify({ type: "translation", ...global.latestTranslation }));
   ws.send(JSON.stringify({ type: "status", live: global.isLive || false }));
-  ws.on("close", () => { viewers.delete(ws); });
+  ws.on("close", () => viewers.delete(ws));
 });
 
 function broadcast(data) {
@@ -139,24 +199,17 @@ function broadcast(data) {
 }
 
 // ── Translation ───────────────────────────────────────────────
-let pendingText = "";
-let translationTimer = null;
-let segmentStartTime = null;
+let pendingText = "", translationTimer = null, segmentStartTime = null;
 
 async function translateText(text, startTime) {
   const langStr = Object.entries(TARGET_LANGUAGES).map(([c,n]) => `${n} (${c})`).join(", ");
   const msg = await anthropic.messages.create({
-    model: "claude-sonnet-4-20250514",
-    max_tokens: 2000,
-    messages: [{
-      role: "user",
-      content: `You are a live ministry translation engine for a Christian healing program. Translate the following spoken English text into: ${langStr}.\n\nMaintain the spiritual tone and meaning. Respond ONLY with a valid JSON object where keys are language codes and values are translations. No markdown, no preamble.\n\nText: "${text.replace(/"/g, '\\"')}"`
-    }]
+    model: "claude-sonnet-4-20250514", max_tokens: 2000,
+    messages: [{ role: "user", content: `You are a live ministry translation engine for a Christian healing program. Translate the following spoken English text into: ${langStr}.\n\nMaintain the spiritual tone and meaning. Respond ONLY with a valid JSON object where keys are language codes and values are translations. No markdown, no preamble.\n\nText: "${text.replace(/"/g, '\\"')}"` }]
   });
   const raw = msg.content[0].text.replace(/```json|```/g, "").trim();
   const translations = JSON.parse(raw);
-  const endTime = new Date();
-  recordSegment(text, translations, startTime || new Date(), endTime);
+  recordSegment(text, translations, startTime || new Date(), new Date());
   return translations;
 }
 
@@ -190,14 +243,25 @@ async function startPipeline() {
     smart_format: true, interim_results: true, utterance_end_ms: 2000
   });
 
-  dgConnection.on(LiveTranscriptionEvents.Open, () => {
+  dgConnection.on(LiveTranscriptionEvents.Open, async () => {
     console.log("✅ Deepgram connected");
-    global.isLive = true;
-    broadcast({ type: "status", live: true });
-    if (HLS_URL) {
-      startFFmpeg(dgConnection);
+
+    // Try to get HLS URL
+    const hlsUrl = await getHLSUrl();
+    if (hlsUrl) {
+      global.isLive = true;
+      broadcast({ type: "status", live: true });
+      startFFmpeg(dgConnection, hlsUrl);
     } else {
-      console.log("⚠️  No HLS_URL set — waiting for HLS URL to be configured");
+      console.log("⚠️ No HLS URL available — retrying in 60 seconds");
+      setTimeout(async () => {
+        const url = await getHLSUrl();
+        if (url) {
+          global.isLive = true;
+          broadcast({ type: "status", live: true });
+          startFFmpeg(dgConnection, url);
+        }
+      }, 60000);
     }
   });
 
@@ -205,9 +269,7 @@ async function startPipeline() {
     const alt = data.channel?.alternatives?.[0];
     if (!alt?.transcript) return;
     broadcast({ type: "transcript", text: alt.transcript, isFinal: data.is_final });
-    if (data.is_final && alt.transcript.trim().split(" ").length >= 5) {
-      scheduleTranslation(alt.transcript);
-    }
+    if (data.is_final && alt.transcript.trim().split(" ").length >= 5) scheduleTranslation(alt.transcript);
   });
 
   dgConnection.on(LiveTranscriptionEvents.Close, () => {
@@ -220,24 +282,50 @@ async function startPipeline() {
   dgConnection.on(LiveTranscriptionEvents.Error, (e) => console.error("Deepgram error:", e));
 }
 
-function startFFmpeg(dgConnection) {
-  console.log(`🎬 Starting ffmpeg with: ${HLS_URL}`);
+function startFFmpeg(dgConnection, hlsUrl) {
+  console.log(`🎬 Starting ffmpeg: ${hlsUrl}`);
   const ffmpeg = spawn("ffmpeg", [
-    "-re", "-i", HLS_URL, "-vn",
+    "-i", hlsUrl, "-vn",
     "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
-    "-f", "s16le", "-loglevel", "warning", "pipe:1"
+    "-f", "s16le", "-bufsize", "64k", "-loglevel", "error", "pipe:1"
   ]);
+
   ffmpeg.stdout.on("data", chunk => { if (dgConnection.getReadyState() === 1) dgConnection.send(chunk); });
-  ffmpeg.stderr.on("data", d => { const m = d.toString(); if (m.includes("error")) console.error("ffmpeg:", m.trim()); });
-  ffmpeg.on("close", () => setTimeout(() => startFFmpeg(dgConnection), 3000));
+
+  ffmpeg.on("close", async (code) => {
+    console.log(`🔄 ffmpeg closed (${code}) — refreshing HLS URL...`);
+    // Auto-get new URL on ffmpeg close
+    const newUrl = await getHLSUrl();
+    if (newUrl) {
+      setTimeout(() => startFFmpeg(dgConnection, newUrl), 3000);
+    } else {
+      setTimeout(() => startFFmpeg(dgConnection, hlsUrl), 5000);
+    }
+  });
+
+  ffmpeg.on("error", async (err) => {
+    console.error("ffmpeg error:", err.message);
+    const newUrl = await getHLSUrl();
+    setTimeout(() => startFFmpeg(dgConnection, newUrl || hlsUrl), 5000);
+  });
 }
 
 // ── API ───────────────────────────────────────────────────────
 app.get("/", (req, res) => res.json({
   status: "running", live: global.isLive || false,
   viewers: viewers.size, recording: !!currentSession,
-  segments: currentSession?.segments.length || 0
+  segments: currentSession?.segments.length || 0,
+  hlsUrl: CURRENT_HLS_URL ? "configured" : "not set"
 }));
+
+// Manual HLS URL update endpoint
+app.post("/update-hls", (req, res) => {
+  const { url } = req.body;
+  if (!url) return res.status(400).json({ error: "url required" });
+  CURRENT_HLS_URL = url;
+  console.log(`📡 HLS URL manually updated: ${url}`);
+  res.json({ success: true, url });
+});
 
 app.get("/recordings-list", (req, res) => {
   const files = fs.readdirSync(RECORDINGS_DIR);
