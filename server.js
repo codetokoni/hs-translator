@@ -1,3 +1,4 @@
+// Healing Streams Translation Server v1.0
 const { createClient, LiveTranscriptionEvents } = require("@deepgram/sdk");
 const Anthropic = require("@anthropic-ai/sdk");
 const { spawn }  = require("child_process");
