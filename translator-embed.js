@@ -1,7 +1,7 @@
 (function () {
   'use strict';
 
-  const WS_URL = 'wss://robust-manifestation.up.railway.app'; // ← your Railway URL
+  const WS_URL = 'wss://robust-manifestation-production-f1ea.up.railway.app';
 
   const LANG_NAMES = {
     es:"🇪🇸 Spanish", fr:"🇫🇷 French",   zh:"🇨🇳 Chinese",    ar:"🇸🇦 Arabic",
