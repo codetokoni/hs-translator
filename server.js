@@ -14,7 +14,6 @@ const ANTHROPIC_KEY = process.env.ANTHROPIC_KEY;
 const PORT          = process.env.PORT || 3000;
 const RECORDINGS_DIR = "./recordings";
 
-// HLS_URL can be set via env or auto-detected
 let CURRENT_HLS_URL = process.env.HLS_URL || null;
 
 const TARGET_LANGUAGES = {
@@ -54,19 +53,13 @@ async function fetchHLSUrl() {
       },
       timeout: 10000
     };
-
     const req = https.request(options, (res) => {
       let data = '';
       res.on('data', chunk => data += chunk);
       res.on('end', () => {
-        // Look for m3u8 URL patterns in the page
         const patterns = [
           /https?:\/\/[^"'\s]+\.m3u8[^"'\s]*/g,
-          /src["']?\s*[:=]\s*["']([^"']+\.m3u8[^"']*)/g,
-          /file["']?\s*[:=]\s*["']([^"']+\.m3u8[^"']*)/g,
-          /hls["']?\s*[:=]\s*["']([^"']+\.m3u8[^"']*)/g,
         ];
-
         for (const pattern of patterns) {
           const matches = data.match(pattern);
           if (matches && matches.length > 0) {
@@ -79,7 +72,6 @@ async function fetchHLSUrl() {
         resolve(null);
       });
     });
-
     req.on('error', () => resolve(null));
     req.on('timeout', () => { req.destroy(); resolve(null); });
     req.end();
@@ -87,13 +79,8 @@ async function fetchHLSUrl() {
 }
 
 async function getHLSUrl() {
-  // First try auto-detect
   const detected = await fetchHLSUrl();
-  if (detected) {
-    CURRENT_HLS_URL = detected;
-    return detected;
-  }
-  // Fall back to env variable
+  if (detected) { CURRENT_HLS_URL = detected; return detected; }
   if (CURRENT_HLS_URL) return CURRENT_HLS_URL;
   return null;
 }
@@ -184,7 +171,6 @@ function endSession() {
 
 // ── Viewers ───────────────────────────────────────────────────
 const viewers = new Set();
-
 wss.on("connection", (ws) => {
   viewers.add(ws);
   console.log(`👁 Viewer connected. Total: ${viewers.size}`);
@@ -245,22 +231,16 @@ async function startPipeline() {
 
   dgConnection.on(LiveTranscriptionEvents.Open, async () => {
     console.log("✅ Deepgram connected");
-
-    // Try to get HLS URL
     const hlsUrl = await getHLSUrl();
     if (hlsUrl) {
       global.isLive = true;
       broadcast({ type: "status", live: true });
       startFFmpeg(dgConnection, hlsUrl);
     } else {
-      console.log("⚠️ No HLS URL available — retrying in 60 seconds");
+      console.log("⚠️ No HLS URL — retrying in 60s");
       setTimeout(async () => {
         const url = await getHLSUrl();
-        if (url) {
-          global.isLive = true;
-          broadcast({ type: "status", live: true });
-          startFFmpeg(dgConnection, url);
-        }
+        if (url) { global.isLive = true; broadcast({ type: "status", live: true }); startFFmpeg(dgConnection, url); }
       }, 60000);
     }
   });
@@ -289,20 +269,12 @@ function startFFmpeg(dgConnection, hlsUrl) {
     "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
     "-f", "s16le", "-bufsize", "64k", "-loglevel", "error", "pipe:1"
   ]);
-
   ffmpeg.stdout.on("data", chunk => { if (dgConnection.getReadyState() === 1) dgConnection.send(chunk); });
-
-  ffmpeg.on("close", async (code) => {
-    console.log(`🔄 ffmpeg closed (${code}) — refreshing HLS URL...`);
-    // Auto-get new URL on ffmpeg close
+  ffmpeg.on("close", async () => {
+    console.log("🔄 ffmpeg closed — refreshing HLS URL...");
     const newUrl = await getHLSUrl();
-    if (newUrl) {
-      setTimeout(() => startFFmpeg(dgConnection, newUrl), 3000);
-    } else {
-      setTimeout(() => startFFmpeg(dgConnection, hlsUrl), 5000);
-    }
+    setTimeout(() => startFFmpeg(dgConnection, newUrl || hlsUrl), 3000);
   });
-
   ffmpeg.on("error", async (err) => {
     console.error("ffmpeg error:", err.message);
     const newUrl = await getHLSUrl();
@@ -310,7 +282,7 @@ function startFFmpeg(dgConnection, hlsUrl) {
   });
 }
 
-// ── API ───────────────────────────────────────────────────────
+// ── API Endpoints ─────────────────────────────────────────────
 app.get("/", (req, res) => res.json({
   status: "running", live: global.isLive || false,
   viewers: viewers.size, recording: !!currentSession,
@@ -318,7 +290,74 @@ app.get("/", (req, res) => res.json({
   hlsUrl: CURRENT_HLS_URL ? "configured" : "not set"
 }));
 
-// Manual HLS URL update endpoint
+// ── Admin page to update HLS URL ──────────────────────────────
+app.get("/update-hls", (req, res) => {
+  res.send(`<!DOCTYPE html>
+<html>
+<head>
+  <title>Update HLS URL</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <style>
+    body{font-family:'Segoe UI',sans-serif;background:#0a0a1a;color:#fff;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}
+    .box{background:rgba(255,255,255,.05);border:1px solid rgba(124,58,237,.4);border-radius:16px;padding:32px;width:90%;max-width:500px}
+    h2{margin:0 0 8px;color:#a78bfa}
+    p{color:rgba(255,255,255,.5);font-size:13px;margin:0 0 20px}
+    input{width:100%;background:rgba(0,0,0,.4);border:1px solid rgba(124,58,237,.4);color:#fff;border-radius:8px;padding:12px;font-size:13px;box-sizing:border-box;margin-bottom:12px;outline:none}
+    button{width:100%;background:linear-gradient(135deg,#7c3aed,#2563eb);color:#fff;border:none;border-radius:8px;padding:12px;font-size:15px;font-weight:700;cursor:pointer}
+    #msg{margin-top:12px;padding:10px;border-radius:8px;display:none;font-size:13px;text-align:center}
+    .ok{background:rgba(74,222,128,.15);color:#4ade80;border:1px solid rgba(74,222,128,.3)}
+    .err{background:rgba(239,68,68,.15);color:#fca5a5;border:1px solid rgba(239,68,68,.3)}
+    .status{margin-top:16px;padding:10px;background:rgba(255,255,255,.05);border-radius:8px;font-size:12px;color:rgba(255,255,255,.4)}
+  </style>
+</head>
+<body>
+  <div class="box">
+    <h2>🎙 HLS URL Updater</h2>
+    <p>Paste the new .m3u8 URL from healingstreams.tv to go live instantly</p>
+    <input type="text" id="url" placeholder="https://...chunks.m3u8" />
+    <button onclick="update()">⚡ Update & Go Live</button>
+    <div id="msg"></div>
+    <div class="status" id="status">Loading status...</div>
+  </div>
+  <script>
+    async function update() {
+      const url = document.getElementById('url').value.trim();
+      const msg = document.getElementById('msg');
+      if (!url) { showMsg('Please paste a URL first', false); return; }
+      try {
+        const r = await fetch('/update-hls', {
+          method: 'POST',
+          headers: {'Content-Type':'application/json'},
+          body: JSON.stringify({url})
+        });
+        const d = await r.json();
+        if (d.success) { showMsg('✅ URL updated! Server going live...', true); loadStatus(); }
+        else showMsg('❌ Update failed', false);
+      } catch(e) { showMsg('❌ Error: ' + e.message, false); }
+    }
+    function showMsg(text, ok) {
+      const msg = document.getElementById('msg');
+      msg.textContent = text;
+      msg.className = ok ? 'ok' : 'err';
+      msg.style.display = 'block';
+    }
+    async function loadStatus() {
+      try {
+        const r = await fetch('/');
+        const d = await r.json();
+        document.getElementById('status').innerHTML =
+          'Status: ' + (d.live ? '🟢 LIVE' : '🔴 Offline') +
+          ' | Viewers: ' + d.viewers +
+          ' | HLS: ' + d.hlsUrl;
+      } catch(e) {}
+    }
+    loadStatus();
+    setInterval(loadStatus, 10000);
+  </script>
+</body>
+</html>`);
+});
+
 app.post("/update-hls", (req, res) => {
   const { url } = req.body;
   if (!url) return res.status(400).json({ error: "url required" });
