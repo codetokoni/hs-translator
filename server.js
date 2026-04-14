@@ -1,7 +1,7 @@
 /**
- * Healing Streams Live Translation Server
- * Uses Puppeteer to automatically find & refresh the HLS stream URL
- * No manual URL updates ever needed!
+ * Healing Streams Live Translation Server — Final Version
+ * Auto-discovers HLS URL via Puppeteer
+ * Proper ffmpeg headers for CDN access
  */
 
 const { createClient, LiveTranscriptionEvents } = require("@deepgram/sdk");
@@ -38,11 +38,10 @@ app.use(express.json());
 app.use("/recordings", express.static(RECORDINGS_DIR));
 
 // ── State ─────────────────────────────────────────────────────
-let currentHLSUrl   = process.env.HLS_URL || null;
-let ffmpegProcess   = null;
-let dgConnection    = null;
-let browserInstance = null;
-let isDiscovering   = false;
+let currentHLSUrl = process.env.HLS_URL || null;
+let ffmpegProcess = null;
+let dgConnection  = null;
+let isDiscovering = false;
 
 const TARGET_LANGUAGES = {
   es:"Spanish", fr:"French",  zh:"Chinese",    ar:"Arabic",
@@ -56,88 +55,59 @@ async function discoverHLSWithPuppeteer() {
   if (isDiscovering) return currentHLSUrl;
   isDiscovering = true;
   console.log("🌐 Opening healingstreams.tv with Puppeteer...");
-
   let browser = null;
   try {
     browser = await puppeteer.launch({
       headless: "new",
       args: [
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
-        "--disable-dev-shm-usage",
-        "--disable-gpu",
-        "--no-first-run",
-        "--no-zygote",
-        "--single-process",
-        "--disable-extensions"
+        "--no-sandbox", "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage", "--disable-gpu",
+        "--no-first-run", "--no-zygote",
+        "--single-process", "--disable-extensions"
       ]
     });
-
     const page = await browser.newPage();
     let foundUrl = null;
 
-    // Intercept all network requests
     await page.setRequestInterception(true);
     page.on("request", req => {
       const url = req.url();
-      // Capture m3u8 URLs
       if (url.includes(".m3u8") && !foundUrl) {
         foundUrl = url;
-        console.log(`✅ Puppeteer captured HLS URL: ${url}`);
+        console.log(`✅ Puppeteer found HLS URL: ${url}`);
       }
       req.continue();
     });
-
-    // Also intercept responses
-    page.on("response", async res => {
+    page.on("response", res => {
       const url = res.url();
       if (url.includes(".m3u8") && !foundUrl) {
         foundUrl = url;
-        console.log(`✅ Puppeteer response HLS URL: ${url}`);
+        console.log(`✅ Puppeteer response HLS: ${url}`);
       }
     });
 
-    // Navigate to the live page
     await page.goto(STREAM_PAGE, { waitUntil: "networkidle2", timeout: 30000 });
-
-    // Wait up to 15 seconds for stream to start
+    if (!foundUrl) await new Promise(r => setTimeout(r, 15000));
     if (!foundUrl) {
-      await new Promise(resolve => setTimeout(resolve, 15000));
+      try { await page.click("video"); await new Promise(r => setTimeout(r, 5000)); } catch(e) {}
     }
-
-    // Try clicking play button if present
-    if (!foundUrl) {
-      try {
-        await page.click('video');
-        await new Promise(resolve => setTimeout(resolve, 5000));
-      } catch(e) {}
-    }
-
-    await browser.close();
-    browser = null;
-
-    if (foundUrl) {
-      currentHLSUrl = foundUrl;
-      broadcast({ type: "status", live: true });
-    }
-
+    await browser.close(); browser = null;
+    if (foundUrl) currentHLSUrl = foundUrl;
     return foundUrl;
   } catch(e) {
     console.error("Puppeteer error:", e.message);
     if (browser) { try { await browser.close(); } catch(e2) {} }
-    return currentHLSUrl; // Fall back to last known URL
-  } finally {
-    isDiscovering = false;
-  }
+    return currentHLSUrl;
+  } finally { isDiscovering = false; }
 }
 
-// Auto-refresh HLS URL every 20 minutes
+// Auto-refresh every 20 minutes
 setInterval(async () => {
   console.log("🔄 Auto-refreshing HLS URL...");
   const newUrl = await discoverHLSWithPuppeteer();
   if (newUrl && newUrl !== currentHLSUrl) {
-    console.log("✅ New HLS URL found — restarting stream");
     currentHLSUrl = newUrl;
+    console.log("✅ New HLS URL — restarting ffmpeg");
     restartFFmpeg();
   }
 }, 20 * 60 * 1000);
@@ -159,13 +129,28 @@ function restartFFmpeg() {
 
 function startFFmpeg(dg, hlsUrl) {
   stopFFmpeg();
-  if (!hlsUrl) { console.error("❌ No HLS URL for ffmpeg"); return; }
+  if (!hlsUrl) { console.error("❌ No HLS URL"); return; }
   console.log(`🎬 ffmpeg starting: ${hlsUrl.substring(0, 80)}...`);
 
   const proc = spawn("ffmpeg", [
-    "-i", hlsUrl, "-vn",
-    "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
-    "-f", "s16le", "-bufsize", "64k", "-loglevel", "error", "pipe:1"
+    // Browser headers so CDN allows the request
+    "-user_agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+    "-headers", "Referer: https://healingstreams.tv/\r\nOrigin: https://healingstreams.tv",
+    // Auto-reconnect if stream drops
+    "-reconnect", "1",
+    "-reconnect_at_eof", "1",
+    "-reconnect_streamed", "1",
+    "-reconnect_delay_max", "5",
+    "-timeout", "30000000",
+    "-i", hlsUrl,
+    "-vn",
+    "-acodec", "pcm_s16le",
+    "-ar", "16000",
+    "-ac", "1",
+    "-f", "s16le",
+    "-bufsize", "64k",
+    "-loglevel", "warning",
+    "pipe:1"
   ]);
 
   ffmpegProcess = proc;
@@ -176,7 +161,7 @@ function startFFmpeg(dg, hlsUrl) {
 
   proc.stderr.on("data", d => {
     const m = d.toString().trim();
-    if (m && m.length > 0) console.error("ffmpeg:", m);
+    if (m) console.log("ffmpeg:", m);
   });
 
   proc.on("close", async code => {
@@ -186,14 +171,14 @@ function startFFmpeg(dg, hlsUrl) {
     global.isLive = false;
     broadcast({ type: "status", live: false });
 
-    // Get fresh URL via Puppeteer
+    // Try Puppeteer first, fall back to same URL
     const newUrl = await discoverHLSWithPuppeteer();
-    if (newUrl) {
+    const urlToUse = newUrl || currentHLSUrl;
+    if (urlToUse) {
       global.isLive = true;
       broadcast({ type: "status", live: true });
-      setTimeout(() => startFFmpeg(dg, newUrl), 3000);
+      setTimeout(() => startFFmpeg(dg, urlToUse), 3000);
     } else {
-      // Retry every 30 seconds
       const retry = setInterval(async () => {
         const url = await discoverHLSWithPuppeteer();
         if (url) {
@@ -206,9 +191,13 @@ function startFFmpeg(dg, hlsUrl) {
     }
   });
 
-  proc.on("error", err => {
-    console.error("ffmpeg error:", err.message);
+  proc.on("error", async err => {
+    console.error("ffmpeg spawn error:", err.message);
     ffmpegProcess = null;
+    // If ffmpeg not found, log clearly
+    if (err.code === "ENOENT") {
+      console.error("❌ ffmpeg not installed! Check Dockerfile.");
+    }
   });
 }
 
@@ -338,7 +327,6 @@ async function startPipeline() {
   console.log("🚀 Starting pipeline...");
   global.isLive = false;
   startSession();
-
   if (dgConnection) { try { dgConnection.finish(); } catch(e) {} }
 
   dgConnection = deepgram.listen.live({
@@ -348,13 +336,8 @@ async function startPipeline() {
 
   dgConnection.on(LiveTranscriptionEvents.Open, async () => {
     console.log("✅ Deepgram connected");
-    // Try current URL first, then discover
     let hlsUrl = currentHLSUrl;
-    if (hlsUrl) {
-      console.log("🎬 Using existing HLS URL");
-    } else {
-      hlsUrl = await discoverHLSWithPuppeteer();
-    }
+    if (!hlsUrl) hlsUrl = await discoverHLSWithPuppeteer();
     if (hlsUrl) {
       global.isLive = true;
       broadcast({ type:"status", live:true });
@@ -363,11 +346,7 @@ async function startPipeline() {
       console.log("⚠️ No HLS URL — retrying in 60s");
       setTimeout(async () => {
         const url = await discoverHLSWithPuppeteer();
-        if (url) {
-          global.isLive = true;
-          broadcast({ type:"status", live:true });
-          startFFmpeg(dgConnection, url);
-        }
+        if (url) { global.isLive = true; broadcast({ type:"status", live:true }); startFFmpeg(dgConnection, url); }
       }, 60000);
     }
   });
@@ -376,9 +355,7 @@ async function startPipeline() {
     const alt = data.channel?.alternatives?.[0];
     if (!alt?.transcript) return;
     broadcast({ type:"transcript", text:alt.transcript, isFinal:data.is_final });
-    if (data.is_final && alt.transcript.trim().split(" ").length >= 5) {
-      scheduleTranslation(alt.transcript);
-    }
+    if (data.is_final && alt.transcript.trim().split(" ").length >= 5) scheduleTranslation(alt.transcript);
   });
 
   dgConnection.on(LiveTranscriptionEvents.Close, () => {
@@ -397,37 +374,26 @@ app.get("/", (req, res) => res.json({
   status:"running", live: global.isLive||false,
   viewers: viewers.size, recording: !!currentSession,
   segments: currentSession?.segments.length||0,
-  hlsUrl: currentHLSUrl ? currentHLSUrl.substring(0,60)+"..." : "discovering..."
+  hlsUrl: currentHLSUrl ? currentHLSUrl.substring(0,80)+"..." : "discovering..."
 }));
 
-// Manual update + immediate restart
 app.post("/update-hls", (req, res) => {
   const { url } = req.body;
   if (!url) return res.status(400).json({ error:"url required" });
   currentHLSUrl = url;
   res.json({ success:true });
-  console.log("📡 Manual HLS update — restarting stream");
+  console.log("📡 Manual HLS update — restarting ffmpeg");
   setTimeout(() => {
-    if (dgConnection) {
-      global.isLive = true;
-      broadcast({ type:"status", live:true });
-      startFFmpeg(dgConnection, url);
-    }
+    if (dgConnection) { global.isLive = true; broadcast({ type:"status", live:true }); startFFmpeg(dgConnection, url); }
   }, 500);
 });
 
-// Trigger Puppeteer discovery on demand
 app.get("/discover-hls", async (req, res) => {
   const url = await discoverHLSWithPuppeteer();
-  if (url && dgConnection) {
-    global.isLive = true;
-    broadcast({ type:"status", live:true });
-    startFFmpeg(dgConnection, url);
-  }
+  if (url && dgConnection) { global.isLive = true; broadcast({ type:"status", live:true }); startFFmpeg(dgConnection, url); }
   res.json({ url: url||null, live: global.isLive||false });
 });
 
-// Admin page
 app.get("/admin", (req, res) => {
   res.send(`<!DOCTYPE html>
 <html><head>
@@ -458,77 +424,36 @@ input{width:100%;background:rgba(0,0,0,.4);border:1px solid rgba(124,58,237,.4);
 <body>
 <h1>🎙 Healing Streams Translator</h1>
 <p class="sub">Admin Dashboard</p>
-
 <div class="card">
   <h3>📊 Server Status</h3>
   <div class="status">
     <div class="stat"><div class="stat-val" id="sv">—</div><div class="stat-lbl">Viewers</div></div>
     <div class="stat"><div class="stat-val" id="ss">—</div><div class="stat-lbl">Segments</div></div>
   </div>
-  <div style="text-align:center;margin-top:10px">
-    <span class="live-badge live-off" id="sl">Loading...</span>
-  </div>
+  <div style="text-align:center;margin-top:10px"><span class="live-badge live-off" id="sl">Loading...</span></div>
   <div class="hls-url" id="sh">—</div>
 </div>
-
 <div class="card">
   <h3>🔍 Auto-Discover HLS URL</h3>
-  <p style="font-size:12px;color:rgba(255,255,255,.4);margin-bottom:12px">Opens healingstreams.tv automatically and finds the stream URL</p>
+  <p style="font-size:12px;color:rgba(255,255,255,.4);margin-bottom:12px">Opens healingstreams.tv and finds the stream URL automatically</p>
   <button class="btn" onclick="discover()">🔍 Auto-Discover & Go Live</button>
 </div>
-
 <div class="card">
-  <h3>📋 Manual HLS URL Update</h3>
+  <h3>📋 Manual Update</h3>
   <input type="text" id="url" placeholder="https://...chunks.m3u8">
   <button class="btn" onclick="update()">⚡ Update & Go Live</button>
   <div id="msg"></div>
 </div>
-
 <div class="card">
   <h3>📥 Recordings</h3>
   <button class="btn2" onclick="window.open('/recordings-list','_blank')">View All Recordings</button>
 </div>
-
 <script>
-async function discover() {
-  showMsg('🔍 Opening healingstreams.tv... (30 sec)', true);
-  try {
-    const r = await fetch('/discover-hls');
-    const d = await r.json();
-    if (d.url) {
-      document.getElementById('url').value = d.url;
-      showMsg('✅ Found & applied! Stream starting...', true);
-      loadStatus();
-    } else showMsg('❌ Could not find URL. Try manual update.', false);
-  } catch(e) { showMsg('❌ ' + e.message, false); }
-}
-async function update() {
-  const url = document.getElementById('url').value.trim();
-  if (!url) { showMsg('Paste a URL first', false); return; }
-  try {
-    const r = await fetch('/update-hls', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url})});
-    const d = await r.json();
-    if (d.success) { showMsg('✅ Updated! Stream restarting...', true); loadStatus(); }
-    else showMsg('❌ Failed', false);
-  } catch(e) { showMsg('❌ ' + e.message, false); }
-}
-function showMsg(t, ok) {
-  const m = document.getElementById('msg');
-  m.textContent=t; m.className=ok?'ok':'err'; m.style.display='block';
-}
-async function loadStatus() {
-  try {
-    const d = await (await fetch('/')).json();
-    document.getElementById('sv').textContent = d.viewers;
-    document.getElementById('ss').textContent = d.segments;
-    const sl = document.getElementById('sl');
-    sl.textContent = d.live ? '● LIVE' : '○ Offline';
-    sl.className = 'live-badge ' + (d.live ? 'live-on' : 'live-off');
-    document.getElementById('sh').textContent = d.hlsUrl || 'Not configured';
-  } catch(e) {}
-}
-loadStatus();
-setInterval(loadStatus, 5000);
+async function discover(){showMsg('🔍 Opening healingstreams.tv... (30 sec)',true);try{const r=await fetch('/discover-hls');const d=await r.json();if(d.url){document.getElementById('url').value=d.url;showMsg('✅ Found & applied!',true);loadStatus();}else showMsg('❌ Not found. Try manual.',false);}catch(e){showMsg('❌ '+e.message,false);}}
+async function update(){const url=document.getElementById('url').value.trim();if(!url){showMsg('Paste URL first',false);return;}try{const r=await fetch('/update-hls',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url})});const d=await r.json();if(d.success){showMsg('✅ Updated! Restarting...',true);loadStatus();}else showMsg('❌ Failed',false);}catch(e){showMsg('❌ '+e.message,false);}}
+function showMsg(t,ok){const m=document.getElementById('msg');m.textContent=t;m.className=ok?'ok':'err';m.style.display='block';}
+async function loadStatus(){try{const d=await(await fetch('/')).json();document.getElementById('sv').textContent=d.viewers;document.getElementById('ss').textContent=d.segments;const sl=document.getElementById('sl');sl.textContent=d.live?'● LIVE':'○ Offline';sl.className='live-badge '+(d.live?'live-on':'live-off');document.getElementById('sh').textContent=d.hlsUrl||'Not configured';}catch(e){}}
+loadStatus();setInterval(loadStatus,5000);
 </script>
 </body></html>`);
 });
@@ -568,6 +493,6 @@ app.get("/embed.js", (req, res) => {
 
 server.listen(PORT, () => {
   console.log(`\n🌐 Healing Streams Translation Server — Port ${PORT}`);
-  console.log(`📺 Stream page: ${STREAM_PAGE}\n`);
+  console.log(`📺 Stream: ${STREAM_PAGE}\n`);
   startPipeline();
 });
