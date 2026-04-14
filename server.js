@@ -1,34 +1,28 @@
+/**
+ * Healing Streams Live Translation Server
+ * Uses Puppeteer to automatically find & refresh the HLS stream URL
+ * No manual URL updates ever needed!
+ */
+
 const { createClient, LiveTranscriptionEvents } = require("@deepgram/sdk");
 const Anthropic  = require("@anthropic-ai/sdk");
 const { spawn }  = require("child_process");
 const WebSocket  = require("ws");
 const express    = require("express");
 const http       = require("http");
-const https      = require("https");
 const cors       = require("cors");
 const fs         = require("fs");
 const path       = require("path");
+const puppeteer  = require("puppeteer");
 
 const DEEPGRAM_KEY  = process.env.DEEPGRAM_KEY;
 const ANTHROPIC_KEY = process.env.ANTHROPIC_KEY;
 const PORT          = process.env.PORT || 3000;
+const STREAM_PAGE   = process.env.STREAM_URL || "https://healingstreams.tv/live";
 const RECORDINGS_DIR = "./recordings";
 
-let CURRENT_HLS_URL  = process.env.HLS_URL || null;
-let ffmpegProcess    = null;
-let dgConnection     = null;
-let pipelineRunning  = false;
-let restartTimer     = null;
-
-const TARGET_LANGUAGES = {
-  es:"Spanish", fr:"French",  zh:"Chinese",    ar:"Arabic",
-  hi:"Hindi",   pt:"Portuguese", ru:"Russian", de:"German",
-  sw:"Swahili", yo:"Yoruba",  ha:"Hausa",      id:"Indonesian",
-  it:"Italian", ko:"Korean",  ja:"Japanese",   tr:"Turkish"
-};
-
 if (!DEEPGRAM_KEY || !ANTHROPIC_KEY) {
-  console.error("❌ Missing env vars: DEEPGRAM_KEY, ANTHROPIC_KEY");
+  console.error("❌ Missing: DEEPGRAM_KEY, ANTHROPIC_KEY");
   process.exit(1);
 }
 if (!fs.existsSync(RECORDINGS_DIR)) fs.mkdirSync(RECORDINGS_DIR);
@@ -43,361 +37,130 @@ app.use(cors());
 app.use(express.json());
 app.use("/recordings", express.static(RECORDINGS_DIR));
 
-// ── HLS Auto-Discovery ────────────────────────────────────────
-// Tries multiple methods to find the live HLS URL automatically
+// ── State ─────────────────────────────────────────────────────
+let currentHLSUrl   = process.env.HLS_URL || null;
+let ffmpegProcess   = null;
+let dgConnection    = null;
+let browserInstance = null;
+let isDiscovering   = false;
 
-function httpsGet(url, options = {}) {
-  return new Promise((resolve) => {
-    const urlObj = new URL(url);
-    const reqOptions = {
-      hostname: urlObj.hostname,
-      path: urlObj.pathname + urlObj.search,
-      method: 'GET',
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.5',
-        ...options.headers
-      },
-      timeout: 15000
-    };
-    const req = https.request(reqOptions, (res) => {
-      // Follow redirects
-      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-        return resolve(httpsGet(res.headers.location, options));
-      }
-      let data = '';
-      res.on('data', chunk => data += chunk);
-      res.on('end', () => resolve({ status: res.statusCode, body: data, headers: res.headers }));
-    });
-    req.on('error', () => resolve(null));
-    req.on('timeout', () => { req.destroy(); resolve(null); });
-    req.end();
-  });
-}
+const TARGET_LANGUAGES = {
+  es:"Spanish", fr:"French",  zh:"Chinese",    ar:"Arabic",
+  hi:"Hindi",   pt:"Portuguese", ru:"Russian", de:"German",
+  sw:"Swahili", yo:"Yoruba",  ha:"Hausa",      id:"Indonesian",
+  it:"Italian", ko:"Korean",  ja:"Japanese",   tr:"Turkish"
+};
 
-function extractM3U8(html) {
-  if (!html) return null;
-  // Patterns to find m3u8 URLs in page source
-  const patterns = [
-    /["'](https?:\/\/[^"']+\.m3u8[^"']*?)["']/g,
-    /source\s*[:=]\s*["'](https?:\/\/[^"']+\.m3u8[^"']*?)["']/g,
-    /file\s*[:=]\s*["'](https?:\/\/[^"']+\.m3u8[^"']*?)["']/g,
-    /src\s*[:=]\s*["'](https?:\/\/[^"']+\.m3u8[^"']*?)["']/g,
-    /url\s*[:=]\s*["'](https?:\/\/[^"']+\.m3u8[^"']*?)["']/g,
-    /(https?:\/\/[^\s"'<>]+\.m3u8[^\s"'<>]*)/g,
-  ];
-  for (const pattern of patterns) {
-    pattern.lastIndex = 0;
-    const match = pattern.exec(html);
-    if (match) {
-      const url = (match[1] || match[0]).trim();
-      if (url.startsWith('http')) return url;
-    }
-  }
-  return null;
-}
+// ── Puppeteer HLS Discovery ───────────────────────────────────
+async function discoverHLSWithPuppeteer() {
+  if (isDiscovering) return currentHLSUrl;
+  isDiscovering = true;
+  console.log("🌐 Opening healingstreams.tv with Puppeteer...");
 
-async function discoverHLSUrl() {
-  console.log("🔍 Discovering HLS URL from healingstreams.tv...");
-
-  // Method 1: Direct page scrape
-  const pages = [
-    'https://healingstreams.tv/live',
-    'https://www.healingstreams.tv/live',
-    'https://healingstreams.tv/watch-live',
-  ];
-
-  for (const pageUrl of pages) {
-    const res = await httpsGet(pageUrl);
-    if (res?.body) {
-      const url = extractM3U8(res.body);
-      if (url) {
-        console.log(`✅ Found HLS URL via page scrape: ${url}`);
-        return url;
-      }
-      // Look for JS config files referenced in the page
-      const jsMatches = res.body.match(/["'](\/[^"']+\.js[^"']*?)["']/g) || [];
-      for (const jsMatch of jsMatches.slice(0, 5)) {
-        const jsPath = jsMatch.replace(/["']/g, '');
-        if (jsPath.includes('player') || jsPath.includes('live') || jsPath.includes('stream')) {
-          const jsRes = await httpsGet(`https://healingstreams.tv${jsPath}`);
-          if (jsRes?.body) {
-            const jsUrl = extractM3U8(jsRes.body);
-            if (jsUrl) {
-              console.log(`✅ Found HLS URL in JS file: ${jsUrl}`);
-              return jsUrl;
-            }
-          }
-        }
-      }
-    }
-  }
-
-  // Method 2: Try common stream endpoints
-  const streamEndpoints = [
-    'https://healingstreams.tv/api/stream',
-    'https://healingstreams.tv/api/live',
-    'https://healingstreams.tv/stream.m3u8',
-    'https://live.healingstreams.tv/stream.m3u8',
-  ];
-
-  for (const endpoint of streamEndpoints) {
-    const res = await httpsGet(endpoint);
-    if (res?.status === 200) {
-      if (res.body.includes('#EXTM3U') || res.body.includes('.m3u8')) {
-        console.log(`✅ Found HLS endpoint: ${endpoint}`);
-        return endpoint;
-      }
-    }
-  }
-
-  // Method 3: Fall back to current known URL
-  if (CURRENT_HLS_URL) {
-    console.log("⚠️ Using cached HLS URL");
-    return CURRENT_HLS_URL;
-  }
-
-  console.log("❌ Could not auto-discover HLS URL");
-  return null;
-}
-
-async function validateHLSUrl(url) {
-  if (!url) return false;
+  let browser = null;
   try {
-    const res = await httpsGet(url);
-    return res?.status === 200 && (res.body.includes('#EXTM3U') || res.body.includes('EXTINF'));
-  } catch { return false; }
-}
+    browser = await puppeteer.launch({
+      headless: "new",
+      args: [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+        "--no-first-run",
+        "--no-zygote",
+        "--single-process",
+        "--disable-extensions"
+      ]
+    });
 
-async function getValidHLSUrl() {
-  // First validate current URL
-  if (CURRENT_HLS_URL) {
-    const valid = await validateHLSUrl(CURRENT_HLS_URL);
-    if (valid) {
-      console.log("✅ Current HLS URL is valid");
-      return CURRENT_HLS_URL;
+    const page = await browser.newPage();
+    let foundUrl = null;
+
+    // Intercept all network requests
+    await page.setRequestInterception(true);
+    page.on("request", req => {
+      const url = req.url();
+      // Capture m3u8 URLs
+      if (url.includes(".m3u8") && !foundUrl) {
+        foundUrl = url;
+        console.log(`✅ Puppeteer captured HLS URL: ${url}`);
+      }
+      req.continue();
+    });
+
+    // Also intercept responses
+    page.on("response", async res => {
+      const url = res.url();
+      if (url.includes(".m3u8") && !foundUrl) {
+        foundUrl = url;
+        console.log(`✅ Puppeteer response HLS URL: ${url}`);
+      }
+    });
+
+    // Navigate to the live page
+    await page.goto(STREAM_PAGE, { waitUntil: "networkidle2", timeout: 30000 });
+
+    // Wait up to 15 seconds for stream to start
+    if (!foundUrl) {
+      await new Promise(resolve => setTimeout(resolve, 15000));
     }
-    console.log("⚠️ Current HLS URL expired — discovering new one...");
+
+    // Try clicking play button if present
+    if (!foundUrl) {
+      try {
+        await page.click('video');
+        await new Promise(resolve => setTimeout(resolve, 5000));
+      } catch(e) {}
+    }
+
+    await browser.close();
+    browser = null;
+
+    if (foundUrl) {
+      currentHLSUrl = foundUrl;
+      broadcast({ type: "status", live: true });
+    }
+
+    return foundUrl;
+  } catch(e) {
+    console.error("Puppeteer error:", e.message);
+    if (browser) { try { await browser.close(); } catch(e2) {} }
+    return currentHLSUrl; // Fall back to last known URL
+  } finally {
+    isDiscovering = false;
   }
-  // Discover new URL
-  const newUrl = await discoverHLSUrl();
-  if (newUrl) {
-    CURRENT_HLS_URL = newUrl;
-    broadcast({ type: "hls_updated", url: newUrl });
-  }
-  return newUrl;
 }
 
-// Auto-refresh every 15 minutes
+// Auto-refresh HLS URL every 20 minutes
 setInterval(async () => {
-  console.log("🔄 Scheduled HLS URL refresh...");
-  const valid = await validateHLSUrl(CURRENT_HLS_URL);
-  if (!valid) {
-    console.log("🔄 HLS URL invalid — refreshing...");
-    const newUrl = await discoverHLSUrl();
-    if (newUrl && newUrl !== CURRENT_HLS_URL) {
-      CURRENT_HLS_URL = newUrl;
-      console.log("✅ HLS URL refreshed:", newUrl);
-      restartFFmpeg();
-    }
+  console.log("🔄 Auto-refreshing HLS URL...");
+  const newUrl = await discoverHLSWithPuppeteer();
+  if (newUrl && newUrl !== currentHLSUrl) {
+    console.log("✅ New HLS URL found — restarting stream");
+    currentHLSUrl = newUrl;
+    restartFFmpeg();
   }
-}, 15 * 60 * 1000);
+}, 20 * 60 * 1000);
 
-// ── ffmpeg management ─────────────────────────────────────────
+// ── ffmpeg ────────────────────────────────────────────────────
 function stopFFmpeg() {
   if (ffmpegProcess) {
-    try { ffmpegProcess.kill('SIGTERM'); } catch(e) {}
+    try { ffmpegProcess.kill("SIGTERM"); } catch(e) {}
     ffmpegProcess = null;
   }
 }
 
 function restartFFmpeg() {
   stopFFmpeg();
-  if (dgConnection) {
-    setTimeout(() => startFFmpeg(dgConnection), 2000);
+  if (dgConnection && currentHLSUrl) {
+    setTimeout(() => startFFmpeg(dgConnection, currentHLSUrl), 2000);
   }
-}
-
-// ── Session Recording ─────────────────────────────────────────
-let currentSession = null;
-
-function startSession() {
-  const now = new Date();
-  const sessionId = `session_${now.toISOString().replace(/[:.]/g, "-").slice(0, 19)}`;
-  currentSession = {
-    id: sessionId, startTime: now.toISOString(), endTime: null,
-    segments: [], srtIndex: 1,
-    paths: {
-      json: path.join(RECORDINGS_DIR, `${sessionId}.json`),
-      csv:  path.join(RECORDINGS_DIR, `${sessionId}.csv`),
-      srt:  path.join(RECORDINGS_DIR, `${sessionId}.srt`),
-      txt:  path.join(RECORDINGS_DIR, `${sessionId}_transcript.txt`)
-    }
-  };
-  const langHeaders = Object.keys(TARGET_LANGUAGES).map(c => `"${TARGET_LANGUAGES[c]}"`).join(",");
-  fs.writeFileSync(currentSession.paths.csv, `"#","Timestamp","Duration","English Transcript",${langHeaders}\n`);
-  fs.writeFileSync(currentSession.paths.srt, "");
-  fs.writeFileSync(currentSession.paths.txt, `Healing Streams Live Transcript\nSession: ${sessionId}\nStarted: ${now.toLocaleString()}\n${"=".repeat(60)}\n\n`);
-  console.log(`📼 Recording started: ${sessionId}`);
-}
-
-function recordSegment(transcript, translations, startTime, endTime) {
-  if (!currentSession) return;
-  const seg = {
-    index: currentSession.segments.length + 1,
-    timestamp: startTime.toISOString(),
-    startTime: startTime.toISOString(),
-    endTime: endTime.toISOString(),
-    durationSeconds: ((endTime - startTime) / 1000).toFixed(1),
-    transcript, translations
-  };
-  currentSession.segments.push(seg);
-  fs.writeFileSync(currentSession.paths.json, JSON.stringify({
-    session: currentSession.id, startTime: currentSession.startTime,
-    totalSegments: currentSession.segments.length,
-    languages: Object.keys(TARGET_LANGUAGES), segments: currentSession.segments
-  }, null, 2));
-  const langValues = Object.keys(TARGET_LANGUAGES).map(c => `"${(translations[c]||"").replace(/"/g,'""')}"`).join(",");
-  fs.appendFileSync(currentSession.paths.csv, `${seg.index},"${seg.timestamp}","${seg.durationSeconds}s","${transcript.replace(/"/g,'""')}",${langValues}\n`);
-  const srtStart = formatSRTTime(startTime), srtEnd = formatSRTTime(endTime);
-  fs.appendFileSync(currentSession.paths.srt, `${currentSession.srtIndex}\n${srtStart} --> ${srtEnd}\n${transcript}\n\n`);
-  currentSession.srtIndex++;
-  fs.appendFileSync(currentSession.paths.txt, `[${startTime.toLocaleTimeString()}]\n${transcript}\n\n`);
-  console.log(`📝 Segment #${seg.index}: "${transcript.substring(0,50)}..."`);
-}
-
-function formatSRTTime(d) {
-  return `${String(d.getHours()).padStart(2,"0")}:${String(d.getMinutes()).padStart(2,"0")}:${String(d.getSeconds()).padStart(2,"0")},${String(d.getMilliseconds()).padStart(3,"0")}`;
-}
-
-function endSession() {
-  if (!currentSession) return;
-  currentSession.endTime = new Date().toISOString();
-  fs.writeFileSync(currentSession.paths.json, JSON.stringify({
-    session: currentSession.id, startTime: currentSession.startTime,
-    endTime: currentSession.endTime,
-    totalSegments: currentSession.segments.length,
-    languages: Object.keys(TARGET_LANGUAGES), segments: currentSession.segments
-  }, null, 2));
-  console.log(`📼 Session ended: ${currentSession.segments.length} segments`);
-  currentSession = null;
-}
-
-// ── Viewers ───────────────────────────────────────────────────
-const viewers = new Set();
-wss.on("connection", (ws) => {
-  viewers.add(ws);
-  console.log(`👁 Viewer connected. Total: ${viewers.size}`);
-  if (global.latestTranslation) ws.send(JSON.stringify({ type:"translation", ...global.latestTranslation }));
-  ws.send(JSON.stringify({ type:"status", live: global.isLive || false }));
-  ws.on("close", () => viewers.delete(ws));
-});
-
-function broadcast(data) {
-  const msg = JSON.stringify(data);
-  viewers.forEach(v => { if (v.readyState === WebSocket.OPEN) v.send(msg); });
-}
-
-// ── Translation ───────────────────────────────────────────────
-let pendingText = "", translationTimer = null, segmentStartTime = null;
-
-async function translateText(text, startTime) {
-  const langStr = Object.entries(TARGET_LANGUAGES).map(([c,n]) => `${n} (${c})`).join(", ");
-  const msg = await anthropic.messages.create({
-    model: "claude-sonnet-4-20250514", max_tokens: 2000,
-    messages:[{role:"user", content:`You are a live ministry translation engine for a Christian healing program. Translate the following spoken English text into: ${langStr}.\n\nMaintain the spiritual tone and meaning. Respond ONLY with a valid JSON object where keys are language codes and values are translations. No markdown, no preamble.\n\nText: "${text.replace(/"/g,'\\"')}"`}]
-  });
-  const raw = msg.content[0].text.replace(/```json|```/g,"").trim();
-  const translations = JSON.parse(raw);
-  recordSegment(text, translations, startTime || new Date(), new Date());
-  return translations;
-}
-
-function scheduleTranslation(transcript) {
-  if (!segmentStartTime) segmentStartTime = new Date();
-  pendingText += " " + transcript;
-  clearTimeout(translationTimer);
-  translationTimer = setTimeout(async () => {
-    const text = pendingText.trim(), startTime = segmentStartTime;
-    pendingText = ""; segmentStartTime = null;
-    if (!text) return;
-    try {
-      const translations = await translateText(text, startTime);
-      const payload = { translations, transcript: text };
-      global.latestTranslation = payload;
-      broadcast({ type:"translation", ...payload });
-      console.log(`✅ Translated: "${text.substring(0,50)}..."`);
-    } catch(e) { console.error("Translation error:", e.message); }
-  }, 2500);
-}
-
-// ── Pipeline ──────────────────────────────────────────────────
-async function startPipeline() {
-  if (pipelineRunning) {
-    console.log("⚠️ Pipeline already running — restarting ffmpeg only");
-    restartFFmpeg();
-    return;
-  }
-  pipelineRunning = true;
-  console.log("🎙 Starting pipeline...");
-  global.isLive = false;
-  startSession();
-
-  // Close existing connection
-  if (dgConnection) { try { dgConnection.finish(); } catch(e) {} dgConnection = null; }
-
-  dgConnection = deepgram.listen.live({
-    model:"nova-2", language:"en-US",
-    smart_format:true, interim_results:true, utterance_end_ms:2000
-  });
-
-  dgConnection.on(LiveTranscriptionEvents.Open, async () => {
-    console.log("✅ Deepgram connected");
-    const hlsUrl = await getValidHLSUrl();
-    if (hlsUrl) {
-      global.isLive = true;
-      broadcast({ type:"status", live:true });
-      startFFmpeg(dgConnection, hlsUrl);
-    } else {
-      console.log("⚠️ No HLS URL — will retry every 30s");
-      const retryInterval = setInterval(async () => {
-        const url = await getValidHLSUrl();
-        if (url) {
-          clearInterval(retryInterval);
-          global.isLive = true;
-          broadcast({ type:"status", live:true });
-          startFFmpeg(dgConnection, url);
-        }
-      }, 30000);
-    }
-  });
-
-  dgConnection.on(LiveTranscriptionEvents.Transcript, (data) => {
-    const alt = data.channel?.alternatives?.[0];
-    if (!alt?.transcript) return;
-    broadcast({ type:"transcript", text:alt.transcript, isFinal:data.is_final });
-    if (data.is_final && alt.transcript.trim().split(" ").length >= 5) scheduleTranslation(alt.transcript);
-  });
-
-  dgConnection.on(LiveTranscriptionEvents.Close, () => {
-    console.log("🔄 Deepgram closed — restarting in 5s...");
-    pipelineRunning = false;
-    global.isLive = false;
-    endSession();
-    broadcast({ type:"status", live:false });
-    clearTimeout(restartTimer);
-    restartTimer = setTimeout(startPipeline, 5000);
-  });
-
-  dgConnection.on(LiveTranscriptionEvents.Error, (e) => {
-    console.error("Deepgram error:", e.message || e);
-  });
 }
 
 function startFFmpeg(dg, hlsUrl) {
   stopFFmpeg();
-  console.log(`🎬 Starting ffmpeg: ${hlsUrl}`);
+  if (!hlsUrl) { console.error("❌ No HLS URL for ffmpeg"); return; }
+  console.log(`🎬 ffmpeg starting: ${hlsUrl.substring(0, 80)}...`);
 
   const proc = spawn("ffmpeg", [
     "-i", hlsUrl, "-vn",
@@ -413,41 +176,220 @@ function startFFmpeg(dg, hlsUrl) {
 
   proc.stderr.on("data", d => {
     const m = d.toString().trim();
-    if (m) console.error("ffmpeg:", m);
+    if (m && m.length > 0) console.error("ffmpeg:", m);
   });
 
-  proc.on("close", async (code) => {
-    if (ffmpegProcess !== proc) return; // Already replaced
-    console.log(`🔄 ffmpeg exited (${code}) — getting new HLS URL...`);
-    global.isLive = false;
-    broadcast({ type:"status", live:false });
+  proc.on("close", async code => {
+    if (ffmpegProcess !== proc) return;
+    console.log(`🔄 ffmpeg closed (${code}) — getting fresh URL...`);
     ffmpegProcess = null;
+    global.isLive = false;
+    broadcast({ type: "status", live: false });
 
-    // Get fresh URL and restart
-    const newUrl = await getValidHLSUrl();
+    // Get fresh URL via Puppeteer
+    const newUrl = await discoverHLSWithPuppeteer();
     if (newUrl) {
-      console.log(`🔄 Restarting with: ${newUrl}`);
       global.isLive = true;
-      broadcast({ type:"status", live:true });
+      broadcast({ type: "status", live: true });
       setTimeout(() => startFFmpeg(dg, newUrl), 3000);
     } else {
-      // Keep retrying every 30s
-      const retryInterval = setInterval(async () => {
-        const url = await getValidHLSUrl();
+      // Retry every 30 seconds
+      const retry = setInterval(async () => {
+        const url = await discoverHLSWithPuppeteer();
         if (url) {
-          clearInterval(retryInterval);
+          clearInterval(retry);
           global.isLive = true;
-          broadcast({ type:"status", live:true });
+          broadcast({ type: "status", live: true });
           startFFmpeg(dg, url);
         }
       }, 30000);
     }
   });
 
-  proc.on("error", (err) => {
-    console.error("ffmpeg spawn error:", err.message);
+  proc.on("error", err => {
+    console.error("ffmpeg error:", err.message);
     ffmpegProcess = null;
   });
+}
+
+// ── Session Recording ─────────────────────────────────────────
+let currentSession = null;
+
+function startSession() {
+  const now = new Date();
+  const id = `session_${now.toISOString().replace(/[:.]/g,"-").slice(0,19)}`;
+  currentSession = {
+    id, startTime: now.toISOString(), endTime: null,
+    segments: [], srtIndex: 1,
+    paths: {
+      json: path.join(RECORDINGS_DIR, `${id}.json`),
+      csv:  path.join(RECORDINGS_DIR, `${id}.csv`),
+      srt:  path.join(RECORDINGS_DIR, `${id}.srt`),
+      txt:  path.join(RECORDINGS_DIR, `${id}_transcript.txt`)
+    }
+  };
+  const hdr = Object.keys(TARGET_LANGUAGES).map(c=>`"${TARGET_LANGUAGES[c]}"`).join(",");
+  fs.writeFileSync(currentSession.paths.csv, `"#","Timestamp","Duration","English",${hdr}\n`);
+  fs.writeFileSync(currentSession.paths.srt, "");
+  fs.writeFileSync(currentSession.paths.txt,
+    `Healing Streams Transcript\nSession: ${id}\nStarted: ${now.toLocaleString()}\n${"=".repeat(60)}\n\n`);
+  console.log(`📼 Session started: ${id}`);
+}
+
+function recordSegment(transcript, translations, t0, t1) {
+  if (!currentSession) return;
+  const seg = {
+    index: currentSession.segments.length + 1,
+    timestamp: t0.toISOString(), startTime: t0.toISOString(),
+    endTime: t1.toISOString(),
+    durationSeconds: ((t1 - t0)/1000).toFixed(1),
+    transcript, translations
+  };
+  currentSession.segments.push(seg);
+  fs.writeFileSync(currentSession.paths.json, JSON.stringify({
+    session: currentSession.id, startTime: currentSession.startTime,
+    totalSegments: currentSession.segments.length,
+    languages: Object.keys(TARGET_LANGUAGES),
+    segments: currentSession.segments
+  }, null, 2));
+  const vals = Object.keys(TARGET_LANGUAGES).map(c=>`"${(translations[c]||"").replace(/"/g,'""')}"`).join(",");
+  fs.appendFileSync(currentSession.paths.csv,
+    `${seg.index},"${seg.timestamp}","${seg.durationSeconds}s","${transcript.replace(/"/g,'""')}",${vals}\n`);
+  const s0 = fmtSRT(t0), s1 = fmtSRT(t1);
+  fs.appendFileSync(currentSession.paths.srt,
+    `${currentSession.srtIndex}\n${s0} --> ${s1}\n${transcript}\n\n`);
+  currentSession.srtIndex++;
+  fs.appendFileSync(currentSession.paths.txt, `[${t0.toLocaleTimeString()}]\n${transcript}\n\n`);
+  console.log(`📝 Segment #${seg.index}: "${transcript.substring(0,60)}"`);
+}
+
+function fmtSRT(d) {
+  return `${String(d.getHours()).padStart(2,"0")}:${String(d.getMinutes()).padStart(2,"0")}:${String(d.getSeconds()).padStart(2,"0")},${String(d.getMilliseconds()).padStart(3,"0")}`;
+}
+
+function endSession() {
+  if (!currentSession) return;
+  currentSession.endTime = new Date().toISOString();
+  fs.writeFileSync(currentSession.paths.json, JSON.stringify({
+    session: currentSession.id, startTime: currentSession.startTime,
+    endTime: currentSession.endTime,
+    totalSegments: currentSession.segments.length,
+    languages: Object.keys(TARGET_LANGUAGES),
+    segments: currentSession.segments
+  }, null, 2));
+  console.log(`📼 Session ended: ${currentSession.segments.length} segments`);
+  currentSession = null;
+}
+
+// ── Viewers ───────────────────────────────────────────────────
+const viewers = new Set();
+wss.on("connection", ws => {
+  viewers.add(ws);
+  console.log(`👁 Viewer connected. Total: ${viewers.size}`);
+  if (global.latestTranslation) ws.send(JSON.stringify({ type:"translation", ...global.latestTranslation }));
+  ws.send(JSON.stringify({ type:"status", live: global.isLive||false }));
+  ws.on("close", () => viewers.delete(ws));
+});
+
+function broadcast(data) {
+  const msg = JSON.stringify(data);
+  viewers.forEach(v => { if (v.readyState === WebSocket.OPEN) v.send(msg); });
+}
+
+// ── Translation ───────────────────────────────────────────────
+let pendingText = "", translationTimer = null, segmentStart = null;
+
+async function translateText(text, t0) {
+  const langStr = Object.entries(TARGET_LANGUAGES).map(([c,n])=>`${n} (${c})`).join(", ");
+  const msg = await anthropic.messages.create({
+    model: "claude-sonnet-4-20250514", max_tokens: 2000,
+    messages: [{ role: "user", content:
+      `You are a live ministry translation engine for a Christian healing program.
+Translate the following spoken English into: ${langStr}.
+Maintain spiritual tone. Respond ONLY with valid JSON. Keys = language codes, values = translations. No markdown.
+Text: "${text.replace(/"/g,'\\"')}"` }]
+  });
+  const raw = msg.content[0].text.replace(/```json|```/g,"").trim();
+  const translations = JSON.parse(raw);
+  recordSegment(text, translations, t0, new Date());
+  return translations;
+}
+
+function scheduleTranslation(transcript) {
+  if (!segmentStart) segmentStart = new Date();
+  pendingText += " " + transcript;
+  clearTimeout(translationTimer);
+  translationTimer = setTimeout(async () => {
+    const text = pendingText.trim(), t0 = segmentStart;
+    pendingText = ""; segmentStart = null;
+    if (!text) return;
+    try {
+      const translations = await translateText(text, t0);
+      const payload = { translations, transcript: text };
+      global.latestTranslation = payload;
+      broadcast({ type:"translation", ...payload });
+      console.log(`✅ Translated ${Object.keys(translations).length} languages`);
+    } catch(e) { console.error("Translation error:", e.message); }
+  }, 2500);
+}
+
+// ── Pipeline ──────────────────────────────────────────────────
+async function startPipeline() {
+  console.log("🚀 Starting pipeline...");
+  global.isLive = false;
+  startSession();
+
+  if (dgConnection) { try { dgConnection.finish(); } catch(e) {} }
+
+  dgConnection = deepgram.listen.live({
+    model:"nova-2", language:"en-US",
+    smart_format:true, interim_results:true, utterance_end_ms:2000
+  });
+
+  dgConnection.on(LiveTranscriptionEvents.Open, async () => {
+    console.log("✅ Deepgram connected");
+    // Try current URL first, then discover
+    let hlsUrl = currentHLSUrl;
+    if (hlsUrl) {
+      console.log("🎬 Using existing HLS URL");
+    } else {
+      hlsUrl = await discoverHLSWithPuppeteer();
+    }
+    if (hlsUrl) {
+      global.isLive = true;
+      broadcast({ type:"status", live:true });
+      startFFmpeg(dgConnection, hlsUrl);
+    } else {
+      console.log("⚠️ No HLS URL — retrying in 60s");
+      setTimeout(async () => {
+        const url = await discoverHLSWithPuppeteer();
+        if (url) {
+          global.isLive = true;
+          broadcast({ type:"status", live:true });
+          startFFmpeg(dgConnection, url);
+        }
+      }, 60000);
+    }
+  });
+
+  dgConnection.on(LiveTranscriptionEvents.Transcript, data => {
+    const alt = data.channel?.alternatives?.[0];
+    if (!alt?.transcript) return;
+    broadcast({ type:"transcript", text:alt.transcript, isFinal:data.is_final });
+    if (data.is_final && alt.transcript.trim().split(" ").length >= 5) {
+      scheduleTranslation(alt.transcript);
+    }
+  });
+
+  dgConnection.on(LiveTranscriptionEvents.Close, () => {
+    console.log("🔄 Deepgram closed — restarting in 5s...");
+    global.isLive = false;
+    endSession();
+    broadcast({ type:"status", live:false });
+    setTimeout(startPipeline, 5000);
+  });
+
+  dgConnection.on(LiveTranscriptionEvents.Error, e => console.error("Deepgram:", e.message||e));
 }
 
 // ── API ───────────────────────────────────────────────────────
@@ -455,141 +397,143 @@ app.get("/", (req, res) => res.json({
   status:"running", live: global.isLive||false,
   viewers: viewers.size, recording: !!currentSession,
   segments: currentSession?.segments.length||0,
-  hlsUrl: CURRENT_HLS_URL || "not set"
+  hlsUrl: currentHLSUrl ? currentHLSUrl.substring(0,60)+"..." : "discovering..."
 }));
 
-// Admin page
-app.get("/update-hls", (req, res) => {
-  res.send(`<!DOCTYPE html>
-<html>
-<head>
-  <title>HLS URL Manager</title>
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <style>
-    *{box-sizing:border-box;margin:0;padding:0}
-    body{font-family:'Segoe UI',sans-serif;background:#0a0a1a;color:#fff;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}
-    .box{background:rgba(255,255,255,.05);border:1px solid rgba(124,58,237,.4);border-radius:20px;padding:32px;width:100%;max-width:520px}
-    h2{color:#a78bfa;margin-bottom:6px;font-size:20px}
-    .sub{color:rgba(255,255,255,.4);font-size:13px;margin-bottom:24px}
-    label{font-size:12px;color:rgba(255,255,255,.5);display:block;margin-bottom:6px}
-    input{width:100%;background:rgba(0,0,0,.4);border:1px solid rgba(124,58,237,.4);color:#fff;border-radius:10px;padding:12px 14px;font-size:13px;margin-bottom:12px;outline:none;transition:border .2s}
-    input:focus{border-color:#a78bfa}
-    .btn{width:100%;background:linear-gradient(135deg,#7c3aed,#2563eb);color:#fff;border:none;border-radius:10px;padding:14px;font-size:15px;font-weight:700;cursor:pointer;transition:opacity .2s}
-    .btn:hover{opacity:.9}
-    .btn2{width:100%;background:rgba(255,255,255,.07);color:rgba(255,255,255,.6);border:1px solid rgba(255,255,255,.15);border-radius:10px;padding:12px;font-size:13px;font-weight:600;cursor:pointer;margin-top:10px}
-    #msg{margin-top:14px;padding:12px;border-radius:10px;display:none;font-size:13px;text-align:center}
-    .ok{background:rgba(74,222,128,.12);color:#4ade80;border:1px solid rgba(74,222,128,.25)}
-    .err{background:rgba(239,68,68,.12);color:#fca5a5;border:1px solid rgba(239,68,68,.25)}
-    .status-box{margin-top:20px;padding:14px;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);border-radius:10px}
-    .status-row{display:flex;justify-content:space-between;align-items:center;font-size:12px;padding:4px 0}
-    .status-label{color:rgba(255,255,255,.4)}
-    .status-val{font-weight:600}
-    .live{color:#4ade80} .offline{color:#fca5a5}
-    .instructions{margin-top:20px;padding:14px;background:rgba(245,158,11,.08);border:1px solid rgba(245,158,11,.2);border-radius:10px;font-size:12px;color:rgba(255,255,255,.6);line-height:1.8}
-    .instructions strong{color:#f59e0b}
-  </style>
-</head>
-<body>
-<div class="box">
-  <h2>🎙 HLS Stream Manager</h2>
-  <p class="sub">Healing Streams Live Translation Server</p>
-
-  <label>Stream URL (.m3u8)</label>
-  <input type="text" id="url" placeholder="https://...chunks.m3u8" />
-  <button class="btn" onclick="updateHLS()">⚡ Update & Restart Stream</button>
-  <button class="btn2" onclick="autoDiscover()">🔍 Auto-Discover URL</button>
-  <div id="msg"></div>
-
-  <div class="status-box">
-    <div class="status-row"><span class="status-label">Server</span><span class="status-val" id="s-status">Loading...</span></div>
-    <div class="status-row"><span class="status-label">Stream</span><span class="status-val" id="s-live">—</span></div>
-    <div class="status-row"><span class="status-label">Viewers</span><span class="status-val" id="s-viewers">—</span></div>
-    <div class="status-row"><span class="status-label">Segments</span><span class="status-val" id="s-segs">—</span></div>
-    <div class="status-row"><span class="status-label">HLS URL</span><span class="status-val" id="s-hls" style="font-size:10px;max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">—</span></div>
-  </div>
-
-  <div class="instructions">
-    <strong>How to get the m3u8 URL:</strong><br>
-    1. Open healingstreams.tv/live in Chrome<br>
-    2. Press F12 → Network tab → type m3u8<br>
-    3. Refresh page and play the stream<br>
-    4. Click any chunks.m3u8 → copy Request URL<br>
-    5. Paste above and click Update
-  </div>
-</div>
-<script>
-  async function updateHLS() {
-    const url = document.getElementById('url').value.trim();
-    if (!url) { showMsg('Please paste a URL first', false); return; }
-    showMsg('Updating...', true);
-    try {
-      const r = await fetch('/update-hls', {
-        method:'POST', headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({url})
-      });
-      const d = await r.json();
-      if (d.success) { showMsg('✅ Stream updated and restarting!', true); loadStatus(); }
-      else showMsg('❌ ' + (d.error||'Update failed'), false);
-    } catch(e) { showMsg('❌ ' + e.message, false); }
-  }
-
-  async function autoDiscover() {
-    showMsg('🔍 Auto-discovering URL...', true);
-    try {
-      const r = await fetch('/discover-hls');
-      const d = await r.json();
-      if (d.url) {
-        document.getElementById('url').value = d.url;
-        showMsg('✅ URL found! Click Update to apply.', true);
-      } else showMsg('❌ Could not auto-discover. Please paste manually.', false);
-    } catch(e) { showMsg('❌ ' + e.message, false); }
-  }
-
-  function showMsg(text, ok) {
-    const msg = document.getElementById('msg');
-    msg.textContent = text; msg.className = ok ? 'ok' : 'err'; msg.style.display = 'block';
-  }
-
-  async function loadStatus() {
-    try {
-      const r = await fetch('/'); const d = await r.json();
-      document.getElementById('s-status').textContent = '🟢 Running';
-      document.getElementById('s-live').innerHTML = d.live ? '<span class="live">🟢 LIVE</span>' : '<span class="offline">🔴 Offline</span>';
-      document.getElementById('s-viewers').textContent = d.viewers + ' connected';
-      document.getElementById('s-segs').textContent = d.segments + ' translated';
-      document.getElementById('s-hls').textContent = d.hlsUrl || 'Not set';
-      document.getElementById('s-hls').title = d.hlsUrl || '';
-    } catch(e) { document.getElementById('s-status').textContent = '🔴 Error'; }
-  }
-
-  loadStatus();
-  setInterval(loadStatus, 8000);
-</script>
-</body>
-</html>`);
-});
-
-// Update HLS URL AND restart ffmpeg immediately
+// Manual update + immediate restart
 app.post("/update-hls", (req, res) => {
   const { url } = req.body;
   if (!url) return res.status(400).json({ error:"url required" });
-  CURRENT_HLS_URL = url;
-  console.log(`📡 HLS URL updated: ${url}`);
-  res.json({ success:true, url });
-  // Restart ffmpeg with new URL immediately
+  currentHLSUrl = url;
+  res.json({ success:true });
+  console.log("📡 Manual HLS update — restarting stream");
   setTimeout(() => {
-    console.log("🔄 Restarting ffmpeg with new URL...");
-    if (dgConnection) startFFmpeg(dgConnection, url);
-    global.isLive = true;
-    broadcast({ type:"status", live:true });
+    if (dgConnection) {
+      global.isLive = true;
+      broadcast({ type:"status", live:true });
+      startFFmpeg(dgConnection, url);
+    }
   }, 500);
 });
 
-// Trigger auto-discovery
+// Trigger Puppeteer discovery on demand
 app.get("/discover-hls", async (req, res) => {
-  const url = await discoverHLSUrl();
-  res.json({ url: url || null });
+  const url = await discoverHLSWithPuppeteer();
+  if (url && dgConnection) {
+    global.isLive = true;
+    broadcast({ type:"status", live:true });
+    startFFmpeg(dgConnection, url);
+  }
+  res.json({ url: url||null, live: global.isLive||false });
 });
+
+// Admin page
+app.get("/admin", (req, res) => {
+  res.send(`<!DOCTYPE html>
+<html><head>
+<title>HS Translator Admin</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'Segoe UI',sans-serif;background:#0a0a1a;color:#fff;padding:24px;min-height:100vh}
+h1{color:#a78bfa;font-size:20px;margin-bottom:4px}
+.sub{color:rgba(255,255,255,.4);font-size:13px;margin-bottom:24px}
+.card{background:rgba(255,255,255,.05);border:1px solid rgba(124,58,237,.3);border-radius:14px;padding:20px;margin-bottom:16px}
+.card h3{font-size:13px;color:#c4b5fd;margin-bottom:12px}
+input{width:100%;background:rgba(0,0,0,.4);border:1px solid rgba(124,58,237,.4);color:#fff;border-radius:8px;padding:10px 12px;font-size:13px;margin-bottom:10px;outline:none}
+.btn{width:100%;background:linear-gradient(135deg,#7c3aed,#2563eb);color:#fff;border:none;border-radius:8px;padding:12px;font-size:14px;font-weight:700;cursor:pointer;margin-bottom:8px}
+.btn2{width:100%;background:rgba(255,255,255,.07);border:1px solid rgba(255,255,255,.15);color:rgba(255,255,255,.7);border-radius:8px;padding:10px;font-size:13px;cursor:pointer}
+.status{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.stat{background:rgba(0,0,0,.3);border-radius:8px;padding:12px;text-align:center}
+.stat-val{font-size:22px;font-weight:700;color:#a78bfa}
+.stat-lbl{font-size:10px;color:rgba(255,255,255,.4);margin-top:2px}
+.live-badge{display:inline-block;padding:3px 10px;border-radius:20px;font-size:12px;font-weight:700}
+.live-on{background:rgba(74,222,128,.15);color:#4ade80;border:1px solid rgba(74,222,128,.3)}
+.live-off{background:rgba(239,68,68,.15);color:#fca5a5;border:1px solid rgba(239,68,68,.3)}
+#msg{padding:10px;border-radius:8px;margin-top:8px;display:none;font-size:13px;text-align:center}
+.ok{background:rgba(74,222,128,.12);color:#4ade80;border:1px solid rgba(74,222,128,.25)}
+.err{background:rgba(239,68,68,.12);color:#fca5a5;border:1px solid rgba(239,68,68,.25)}
+.hls-url{word-break:break-all;font-size:11px;color:rgba(255,255,255,.4);margin-top:8px;padding:8px;background:rgba(0,0,0,.3);border-radius:6px}
+</style></head>
+<body>
+<h1>🎙 Healing Streams Translator</h1>
+<p class="sub">Admin Dashboard</p>
+
+<div class="card">
+  <h3>📊 Server Status</h3>
+  <div class="status">
+    <div class="stat"><div class="stat-val" id="sv">—</div><div class="stat-lbl">Viewers</div></div>
+    <div class="stat"><div class="stat-val" id="ss">—</div><div class="stat-lbl">Segments</div></div>
+  </div>
+  <div style="text-align:center;margin-top:10px">
+    <span class="live-badge live-off" id="sl">Loading...</span>
+  </div>
+  <div class="hls-url" id="sh">—</div>
+</div>
+
+<div class="card">
+  <h3>🔍 Auto-Discover HLS URL</h3>
+  <p style="font-size:12px;color:rgba(255,255,255,.4);margin-bottom:12px">Opens healingstreams.tv automatically and finds the stream URL</p>
+  <button class="btn" onclick="discover()">🔍 Auto-Discover & Go Live</button>
+</div>
+
+<div class="card">
+  <h3>📋 Manual HLS URL Update</h3>
+  <input type="text" id="url" placeholder="https://...chunks.m3u8">
+  <button class="btn" onclick="update()">⚡ Update & Go Live</button>
+  <div id="msg"></div>
+</div>
+
+<div class="card">
+  <h3>📥 Recordings</h3>
+  <button class="btn2" onclick="window.open('/recordings-list','_blank')">View All Recordings</button>
+</div>
+
+<script>
+async function discover() {
+  showMsg('🔍 Opening healingstreams.tv... (30 sec)', true);
+  try {
+    const r = await fetch('/discover-hls');
+    const d = await r.json();
+    if (d.url) {
+      document.getElementById('url').value = d.url;
+      showMsg('✅ Found & applied! Stream starting...', true);
+      loadStatus();
+    } else showMsg('❌ Could not find URL. Try manual update.', false);
+  } catch(e) { showMsg('❌ ' + e.message, false); }
+}
+async function update() {
+  const url = document.getElementById('url').value.trim();
+  if (!url) { showMsg('Paste a URL first', false); return; }
+  try {
+    const r = await fetch('/update-hls', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url})});
+    const d = await r.json();
+    if (d.success) { showMsg('✅ Updated! Stream restarting...', true); loadStatus(); }
+    else showMsg('❌ Failed', false);
+  } catch(e) { showMsg('❌ ' + e.message, false); }
+}
+function showMsg(t, ok) {
+  const m = document.getElementById('msg');
+  m.textContent=t; m.className=ok?'ok':'err'; m.style.display='block';
+}
+async function loadStatus() {
+  try {
+    const d = await (await fetch('/')).json();
+    document.getElementById('sv').textContent = d.viewers;
+    document.getElementById('ss').textContent = d.segments;
+    const sl = document.getElementById('sl');
+    sl.textContent = d.live ? '● LIVE' : '○ Offline';
+    sl.className = 'live-badge ' + (d.live ? 'live-on' : 'live-off');
+    document.getElementById('sh').textContent = d.hlsUrl || 'Not configured';
+  } catch(e) {}
+}
+loadStatus();
+setInterval(loadStatus, 5000);
+</script>
+</body></html>`);
+});
+
+app.get("/update-hls", (req, res) => res.redirect("/admin"));
 
 app.get("/recordings-list", (req, res) => {
   const files = fs.readdirSync(RECORDINGS_DIR);
@@ -610,9 +554,9 @@ app.get("/current-session", (req, res) => {
     segments:currentSession.segments.length,
     downloads:{
       json:`/recordings/${currentSession.id}.json`,
-      csv: `/recordings/${currentSession.id}.csv`,
-      srt: `/recordings/${currentSession.id}.srt`,
-      txt: `/recordings/${currentSession.id}_transcript.txt`
+      csv:`/recordings/${currentSession.id}.csv`,
+      srt:`/recordings/${currentSession.id}.srt`,
+      txt:`/recordings/${currentSession.id}_transcript.txt`
     }
   });
 });
@@ -623,6 +567,7 @@ app.get("/embed.js", (req, res) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`\n🌐 Healing Streams Translation Server — Port ${PORT}\n`);
+  console.log(`\n🌐 Healing Streams Translation Server — Port ${PORT}`);
+  console.log(`📺 Stream page: ${STREAM_PAGE}\n`);
   startPipeline();
 });
