@@ -1,12 +1,17 @@
 {
   "name": "hs-translator",
-  "version": "1.0.0",
-  "scripts": { "start": "node server.js" },
+  "version": "2.0.0",
+  "description": "Healing Streams Live AI Translation Server",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
   "dependencies": {
-    "@deepgram/sdk": "^3.0.0",
     "@anthropic-ai/sdk": "^0.20.0",
-    "ws": "^8.0.0",
+    "@deepgram/sdk": "^3.0.0",
+    "cors": "^2.8.5",
     "express": "^4.18.0",
-    "cors": "^2.8.5"
+    "puppeteer": "^21.0.0",
+    "ws": "^8.0.0"
   }
 }
