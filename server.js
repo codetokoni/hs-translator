@@ -51,6 +51,10 @@ const TARGET_LANGUAGES = {
 };
 
 // ── Puppeteer HLS Discovery ───────────────────────────────────
+// Store cookies captured by Puppeteer
+let capturedCookies = "";
+let capturedUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36";
+
 async function discoverHLSWithPuppeteer() {
   if (isDiscovering) return currentHLSUrl;
   isDiscovering = true;
@@ -67,18 +71,25 @@ async function discoverHLSWithPuppeteer() {
       ]
     });
     const page = await browser.newPage();
+
+    // Set a real browser user agent
+    await page.setUserAgent(capturedUserAgent);
+
     let foundUrl = null;
+    let foundHeaders = {};
 
     await page.setRequestInterception(true);
     page.on("request", req => {
       const url = req.url();
       if (url.includes(".m3u8") && !foundUrl) {
         foundUrl = url;
+        foundHeaders = req.headers();
         console.log(`✅ Puppeteer found HLS URL: ${url}`);
       }
       req.continue();
     });
-    page.on("response", res => {
+
+    page.on("response", async res => {
       const url = res.url();
       if (url.includes(".m3u8") && !foundUrl) {
         foundUrl = url;
@@ -86,13 +97,36 @@ async function discoverHLSWithPuppeteer() {
       }
     });
 
+    // Navigate to live page
     await page.goto(STREAM_PAGE, { waitUntil: "networkidle2", timeout: 30000 });
+
+    // Wait for stream to start
     if (!foundUrl) await new Promise(r => setTimeout(r, 15000));
+
+    // Try clicking video element
     if (!foundUrl) {
-      try { await page.click("video"); await new Promise(r => setTimeout(r, 5000)); } catch(e) {}
+      try {
+        await page.click("video");
+        await new Promise(r => setTimeout(r, 8000));
+      } catch(e) {}
     }
+
+    // Capture cookies from the browser session
+    const cookies = await page.cookies();
+    if (cookies.length > 0) {
+      capturedCookies = cookies.map(c => `${c.name}=${c.value}`).join("; ");
+      console.log(`🍪 Captured ${cookies.length} cookies for CDN auth`);
+    }
+
+    // Get user agent
+    capturedUserAgent = await page.evaluate(() => navigator.userAgent);
+
     await browser.close(); browser = null;
-    if (foundUrl) currentHLSUrl = foundUrl;
+
+    if (foundUrl) {
+      currentHLSUrl = foundUrl;
+      console.log(`✅ HLS URL ready with CDN cookies`);
+    }
     return foundUrl;
   } catch(e) {
     console.error("Puppeteer error:", e.message);
@@ -132,11 +166,16 @@ function startFFmpeg(dg, hlsUrl) {
   if (!hlsUrl) { console.error("❌ No HLS URL"); return; }
   console.log(`🎬 ffmpeg starting: ${hlsUrl.substring(0, 80)}...`);
 
+  // Build headers including captured cookies
+  let headersStr = `Referer: https://healingstreams.tv/\r\nOrigin: https://healingstreams.tv`;
+  if (capturedCookies) {
+    headersStr += `\r\nCookie: ${capturedCookies}`;
+    console.log("🍪 Using captured cookies for CDN auth");
+  }
+
   const proc = spawn("ffmpeg", [
-    // Browser headers so CDN allows the request
-    "-user_agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
-    "-headers", "Referer: https://healingstreams.tv/\r\nOrigin: https://healingstreams.tv",
-    // Auto-reconnect if stream drops
+    "-user_agent", capturedUserAgent,
+    "-headers", headersStr,
     "-reconnect", "1",
     "-reconnect_at_eof", "1",
     "-reconnect_streamed", "1",
