@@ -370,8 +370,13 @@ async function startPipeline() {
 
   dgConnection = deepgram.listen.live({
     model:"nova-2", language:"en-US",
-    smart_format:true, interim_results:true, utterance_end_ms:2000
-  });
+    smart_format:true, interim_results:true,
+    utterance_end_ms:2000,
+    endpointing:300,
+    vad_events:true,
+    no_delay:true,
+    keepalive:true
+});
 
   dgConnection.on(LiveTranscriptionEvents.Open, async () => {
     console.log("✅ Deepgram connected");
