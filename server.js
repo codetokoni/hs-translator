@@ -374,12 +374,21 @@ async function startPipeline() {
     utterance_end_ms:2000,
     endpointing:300,
     vad_events:true,
-    no_delay:true,
     keepalive:true
 });
 
-  dgConnection.on(LiveTranscriptionEvents.Open, async () => {
+dgConnection.on(LiveTranscriptionEvents.Open, async () => {
     console.log("✅ Deepgram connected");
+
+    // Keepalive to prevent timeout during silence/music
+    const keepAlive = setInterval(() => {
+      try {
+        if (dgConnection?.getReadyState() === 1) {
+          dgConnection.keepAlive();
+        } else { clearInterval(keepAlive); }
+      } catch(e) { clearInterval(keepAlive); }
+    }, 8000);
+
     let hlsUrl = currentHLSUrl;
     if (!hlsUrl) hlsUrl = await discoverHLSWithPuppeteer();
     if (hlsUrl) {
