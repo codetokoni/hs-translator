@@ -353,6 +353,10 @@ async function startPipeline() {
 }
 
 // ── Express app ───────────────────────────────────────────────────
+const app    = express();
+const server = http.createServer(app);
+const wss    = new WebSocket.Server({ server });
+
 app.use(express.json());
 
 // WebSocket upgrade tracking
