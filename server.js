@@ -1,551 +1,656 @@
-/**
- * Healing Streams Live Translation Server — Final Version
- * Auto-discovers HLS URL via Puppeteer
- * Proper ffmpeg headers for CDN access
- */
+'use strict';
 
-const { createClient, LiveTranscriptionEvents } = require("@deepgram/sdk");
-const Anthropic  = require("@anthropic-ai/sdk");
-const { spawn }  = require("child_process");
-const WebSocket  = require("ws");
-const express    = require("express");
-const http       = require("http");
-const cors       = require("cors");
-const fs         = require("fs");
-const path       = require("path");
-const puppeteer  = require("puppeteer");
+// ─────────────────────────────────────────────────────────────────
+//  HLS Live Translation Server — healingstreams.tv
+//  Architecture: Puppeteer discovery → ffmpeg PCM → Deepgram REST
+//                → Anthropic translate → WebSocket broadcast
+// ─────────────────────────────────────────────────────────────────
 
-const DEEPGRAM_KEY  = process.env.DEEPGRAM_KEY;
-const ANTHROPIC_KEY = process.env.ANTHROPIC_KEY;
-const PORT          = process.env.PORT || 3000;
-const STREAM_PAGE   = process.env.STREAM_URL || "https://healingstreams.tv/live";
-const RECORDINGS_DIR = "./recordings";
+const express  = require('express');
+const http     = require('http');
+const WebSocket = require('ws');
+const { spawn } = require('child_process');
+const puppeteer = require('puppeteer');
+const path     = require('path');
+const fs       = require('fs');
 
-if (!DEEPGRAM_KEY || !ANTHROPIC_KEY) {
-  console.error("❌ Missing: DEEPGRAM_KEY, ANTHROPIC_KEY");
-  process.exit(1);
-}
-if (!fs.existsSync(RECORDINGS_DIR)) fs.mkdirSync(RECORDINGS_DIR);
+// ── Config ───────────────────────────────────────────────────────
+const PORT           = process.env.PORT || 3000;
+const DEEPGRAM_KEY   = process.env.DEEPGRAM_KEY   || '';
+const ANTHROPIC_KEY  = process.env.ANTHROPIC_KEY  || process.env.ANTHROPIC_API_KEY || '';
+const HLS_URL_OVERRIDE = process.env.HLS_URL || '';
+const STREAM_PAGE    = 'https://healingstreams.tv/live';
 
-const deepgram  = createClient(DEEPGRAM_KEY);
-const anthropic = new Anthropic({ apiKey: ANTHROPIC_KEY });
-const app       = express();
-const server    = http.createServer(app);
-const wss       = new WebSocket.Server({ server });
+const SAMPLE_RATE    = 16000;
+const CHANNELS       = 1;
+const BYTES_PER_SAMPLE = 2;
+const CHUNK_SECONDS  = 6;
+const CHUNK_BYTES    = SAMPLE_RATE * CHANNELS * BYTES_PER_SAMPLE * CHUNK_SECONDS; // 192 000
 
-app.use(cors());
-app.use(express.json());
-app.use("/recordings", express.static(RECORDINGS_DIR));
+const LANGUAGES = [
+  { code: 'es', name: 'Spanish'    },
+  { code: 'fr', name: 'French'     },
+  { code: 'de', name: 'German'     },
+  { code: 'pt', name: 'Portuguese' },
+  { code: 'it', name: 'Italian'    },
+  { code: 'ar', name: 'Arabic'     },
+  { code: 'ru', name: 'Russian'    },
+  { code: 'zh', name: 'Chinese'    },
+  { code: 'ja', name: 'Japanese'   },
+  { code: 'ko', name: 'Korean'     },
+  { code: 'hi', name: 'Hindi'      },
+  { code: 'nl', name: 'Dutch'      },
+  { code: 'pl', name: 'Polish'     },
+  { code: 'tr', name: 'Turkish'    },
+  { code: 'sw', name: 'Swahili'    },
+  { code: 'id', name: 'Indonesian' },
+];
 
-// ── State ─────────────────────────────────────────────────────
-let currentHLSUrl = process.env.HLS_URL || null;
-let ffmpegProcess = null;
-let dgConnection  = null;
-let isDiscovering = false;
-
-const TARGET_LANGUAGES = {
-  es:"Spanish", fr:"French",  zh:"Chinese",    ar:"Arabic",
-  hi:"Hindi",   pt:"Portuguese", ru:"Russian", de:"German",
-  sw:"Swahili", yo:"Yoruba",  ha:"Hausa",      id:"Indonesian",
-  it:"Italian", ko:"Korean",  ja:"Japanese",   tr:"Turkish"
+// ── State ────────────────────────────────────────────────────────
+const state = {
+  status: 'idle',          // idle | discovering | connecting | streaming | error
+  hlsUrl: HLS_URL_OVERRIDE || null,
+  ffmpegPid: null,
+  clientCount: 0,
+  chunkCount: 0,
+  errorCount: 0,
+  lastTranscript: '',
+  lastChunkAt: null,
+  logs: [],                // ring buffer, max 200 entries
+  translations: [],        // ring buffer, max 20 entries
+  sseClients: new Set(),   // admin SSE connections
 };
 
-// ── Puppeteer HLS Discovery ───────────────────────────────────
-// Store cookies captured by Puppeteer
-let capturedCookies = "";
-let capturedUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36";
+function log(level, msg) {
+  const entry = { t: new Date().toISOString(), level, msg };
+  state.logs.unshift(entry);
+  if (state.logs.length > 200) state.logs.pop();
+  console[level === 'error' ? 'error' : 'log'](`[${level.toUpperCase()}] ${msg}`);
+  broadcastSSE({ type: 'log', ...entry });
+}
 
-async function discoverHLSWithPuppeteer() {
-  if (isDiscovering) return currentHLSUrl;
-  isDiscovering = true;
-  console.log("🌐 Opening healingstreams.tv with Puppeteer...");
-  let browser = null;
+function broadcastSSE(data) {
+  const payload = `data: ${JSON.stringify(data)}\n\n`;
+  for (const res of state.sseClients) {
+    try { res.write(payload); } catch (_) {}
+  }
+}
+
+function updateStatus(newStatus) {
+  state.status = newStatus;
+  broadcastSSE({ type: 'status', status: newStatus, hlsUrl: state.hlsUrl });
+}
+
+// ── WAV header builder ───────────────────────────────────────────
+function buildWav(pcm) {
+  const h = Buffer.alloc(44);
+  const dataLen = pcm.length;
+  h.write('RIFF',     0);  h.writeUInt32LE(36 + dataLen,                    4);
+  h.write('WAVE',     8);  h.write('fmt ',                                  12);
+  h.writeUInt32LE(16,  16); h.writeUInt16LE(1,  20); // PCM
+  h.writeUInt16LE(CHANNELS,                         22);
+  h.writeUInt32LE(SAMPLE_RATE,                      24);
+  h.writeUInt32LE(SAMPLE_RATE * CHANNELS * BYTES_PER_SAMPLE, 28);
+  h.writeUInt16LE(CHANNELS * BYTES_PER_SAMPLE,      32);
+  h.writeUInt16LE(BYTES_PER_SAMPLE * 8,             34);
+  h.write('data', 36);     h.writeUInt32LE(dataLen,                         40);
+  return Buffer.concat([h, pcm]);
+}
+
+// ── Deepgram REST transcription ──────────────────────────────────
+async function transcribeChunk(pcmChunk) {
+  const wav = buildWav(pcmChunk);
+  const res = await fetch(
+    'https://api.deepgram.com/v1/listen?model=nova-2&language=en&punctuate=true&smart_format=true',
+    {
+      method: 'POST',
+      headers: {
+        'Authorization': `Token ${DEEPGRAM_KEY}`,
+        'Content-Type':  'audio/wav',
+      },
+      body: wav,
+      signal: AbortSignal.timeout(15_000),
+    }
+  );
+  if (!res.ok) {
+    const txt = await res.text().catch(() => res.status);
+    throw new Error(`Deepgram ${res.status}: ${txt}`);
+  }
+  const data = await res.json();
+  return data?.results?.channels?.[0]?.alternatives?.[0]?.transcript?.trim() || '';
+}
+
+// ── Anthropic translation ─────────────────────────────────────────
+async function translateText(text) {
+  const langList = LANGUAGES.map(l => `${l.code}: ${l.name}`).join(', ');
+  const res = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'x-api-key':         ANTHROPIC_KEY,
+      'anthropic-version': '2023-06-01',
+      'content-type':      'application/json',
+    },
+    body: JSON.stringify({
+      model:      'claude-haiku-4-5-20251001',
+      max_tokens: 2048,
+      system: `You are a real-time sermon/speech translator. Translate the given English text into ALL of these languages and return ONLY a JSON object (no markdown, no extra text) where each key is the two-letter language code and the value is the translation. Languages: ${langList}`,
+      messages: [{ role: 'user', content: text }],
+    }),
+    signal: AbortSignal.timeout(20_000),
+  });
+  if (!res.ok) {
+    const txt = await res.text().catch(() => res.status);
+    throw new Error(`Anthropic ${res.status}: ${txt}`);
+  }
+  const data = await res.json();
+  const raw = data.content?.[0]?.text || '{}';
+  const clean = raw.replace(/```json|```/g, '').trim();
+  return JSON.parse(clean);
+}
+
+// ── Puppeteer HLS discovery ───────────────────────────────────────
+async function discoverHlsUrl() {
+  if (state.hlsUrl) {
+    log('info', `Using HLS URL from env/cache: ${state.hlsUrl}`);
+    return state.hlsUrl;
+  }
+  log('info', 'Launching Puppeteer to discover HLS stream URL…');
+  updateStatus('discovering');
+
+  const browser = await puppeteer.launch({
+    executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-gpu',
+      '--no-first-run',
+      '--no-zygote',
+    ],
+    headless: true,
+  });
+
   try {
-    browser = await puppeteer.launch({
-      headless: "new",
-      args: [
-        "--no-sandbox", "--disable-setuid-sandbox",
-        "--disable-dev-shm-usage", "--disable-gpu",
-        "--no-first-run", "--no-zygote",
-        "--single-process", "--disable-extensions"
-      ]
-    });
     const page = await browser.newPage();
+    await page.setUserAgent(
+      'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 ' +
+      '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    );
 
-    // Set a real browser user agent
-    await page.setUserAgent(capturedUserAgent);
-
-    let foundUrl = null;
-    let foundHeaders = {};
-
-    await page.setRequestInterception(true);
-    page.on("request", req => {
+    // Intercept all network requests and watch for .m3u8
+    let found = null;
+    page.on('request', req => {
       const url = req.url();
-      if (url.includes(".m3u8") && !foundUrl) {
-        foundUrl = url;
-        foundHeaders = req.headers();
-        console.log(`✅ Puppeteer found HLS URL: ${url}`);
+      if (!found && (url.includes('.m3u8') || url.includes('manifest'))) {
+        found = url;
+        log('info', `Intercepted HLS URL: ${url}`);
       }
-      req.continue();
     });
 
-    page.on("response", async res => {
+    // Also watch XHR/fetch responses
+    page.on('response', async res => {
       const url = res.url();
-      if (url.includes(".m3u8") && !foundUrl) {
-        foundUrl = url;
-        console.log(`✅ Puppeteer response HLS: ${url}`);
+      const ct  = res.headers()['content-type'] || '';
+      if (!found && (url.includes('.m3u8') || ct.includes('application/vnd.apple.mpegurl') || ct.includes('application/x-mpegurl'))) {
+        found = url;
+        log('info', `Found HLS URL in response: ${url}`);
       }
     });
 
-    // Navigate to live page
-    await page.goto(STREAM_PAGE, { waitUntil: "networkidle2", timeout: 30000 });
+    log('info', `Navigating to ${STREAM_PAGE}…`);
+    await page.goto(STREAM_PAGE, { waitUntil: 'networkidle2', timeout: 45_000 });
 
-    // Wait for stream to start
-    if (!foundUrl) await new Promise(r => setTimeout(r, 15000));
-
-    // Try clicking video element
-    if (!foundUrl) {
-      try {
-        await page.click("video");
-        await new Promise(r => setTimeout(r, 8000));
-      } catch(e) {}
+    // Give the player extra time to initialise
+    if (!found) {
+      log('info', 'Page loaded, waiting up to 15s for stream initialisation…');
+      await new Promise(resolve => setTimeout(resolve, 15_000));
     }
 
-    // Capture cookies from the browser session
-    const cookies = await page.cookies();
-    if (cookies.length > 0) {
-      capturedCookies = cookies.map(c => `${c.name}=${c.value}`).join("; ");
-      console.log(`🍪 Captured ${cookies.length} cookies for CDN auth`);
+    // Try extracting from page source as fallback
+    if (!found) {
+      const content = await page.content();
+      const match = content.match(/https?:\/\/[^\s"'<>]+\.m3u8[^\s"'<>]*/);
+      if (match) {
+        found = match[0];
+        log('info', `Extracted HLS URL from page source: ${found}`);
+      }
     }
 
-    // Get user agent
-    capturedUserAgent = await page.evaluate(() => navigator.userAgent);
+    if (!found) throw new Error('Could not find HLS stream URL on page');
 
-    await browser.close(); browser = null;
-
-    if (foundUrl) {
-      currentHLSUrl = foundUrl;
-      console.log(`✅ HLS URL ready with CDN cookies`);
-    }
-    return foundUrl;
-  } catch(e) {
-    console.error("Puppeteer error:", e.message);
-    if (browser) { try { await browser.close(); } catch(e2) {} }
-    return currentHLSUrl;
-  } finally { isDiscovering = false; }
-}
-
-// Auto-refresh every 20 minutes
-setInterval(async () => {
-  console.log("🔄 Auto-refreshing HLS URL...");
-  const newUrl = await discoverHLSWithPuppeteer();
-  if (newUrl && newUrl !== currentHLSUrl) {
-    currentHLSUrl = newUrl;
-    console.log("✅ New HLS URL — restarting ffmpeg");
-    restartFFmpeg();
-  }
-}, 20 * 60 * 1000);
-
-// ── ffmpeg ────────────────────────────────────────────────────
-function stopFFmpeg() {
-  if (ffmpegProcess) {
-    try { ffmpegProcess.kill("SIGTERM"); } catch(e) {}
-    ffmpegProcess = null;
+    state.hlsUrl = found;
+    return found;
+  } finally {
+    await browser.close();
   }
 }
 
-function restartFFmpeg() {
-  stopFFmpeg();
-  if (dgConnection && currentHLSUrl) {
-    setTimeout(() => startFFmpeg(dgConnection, currentHLSUrl), 2000);
-  }
-}
+// ── ffmpeg → PCM pipeline ─────────────────────────────────────────
+let ffmpegProc  = null;
+let pcmBuffer   = Buffer.alloc(0);
+let isProcessing = false;
 
-function startFFmpeg(dg, hlsUrl) {
-  stopFFmpeg();
-  if (!hlsUrl) { console.error("❌ No HLS URL"); return; }
-  console.log(`🎬 ffmpeg starting: ${hlsUrl.substring(0, 80)}...`);
-
-  // Build headers including captured cookies
-  let headersStr = `Referer: https://healingstreams.tv/\r\nOrigin: https://healingstreams.tv`;
-  if (capturedCookies) {
-    headersStr += `\r\nCookie: ${capturedCookies}`;
-    console.log("🍪 Using captured cookies for CDN auth");
-  }
-
-  const proc = spawn("ffmpeg", [
-    "-user_agent", capturedUserAgent,
-    "-headers", headersStr,
-    "-reconnect", "1",
-    "-reconnect_streamed", "1",
-    "-reconnect_delay_max", "2",
-    "-live_start_index", "-3",
-    "-timeout", "10000000",
-    "-i", hlsUrl,
-    "-vn",
-    "-acodec", "pcm_s16le",
-    "-ar", "16000",
-    "-ac", "1",
-    "-f", "s16le",
-    "-bufsize", "64k",
-    "-loglevel", "warning",
-    "pipe:1"
-  ]);
-
-  ffmpegProcess = proc;
-
-  proc.stdout.on("data", chunk => {
-    if (dg?.getReadyState() === 1) dg.send(chunk);
+async function processChunk(chunk) {
+  if (!chunk || chunk.length === 0) return;
+  const text = await transcribeChunk(chunk).catch(err => {
+    log('error', `Deepgram error: ${err.message}`);
+    state.errorCount++;
+    return '';
   });
 
-  proc.stderr.on("data", d => {
-    const m = d.toString().trim();
-    if (m) console.log("ffmpeg:", m);
+  if (!text) {
+    log('info', 'Empty transcript — silent/noise chunk, skipping');
+    return;
+  }
+
+  state.lastTranscript = text;
+  state.lastChunkAt    = new Date().toISOString();
+  state.chunkCount++;
+  log('info', `Transcript [${state.chunkCount}]: ${text}`);
+
+  const translations = await translateText(text).catch(err => {
+    log('error', `Anthropic error: ${err.message}`);
+    state.errorCount++;
+    return {};
   });
 
-  proc.on("close", async code => {
-    if (ffmpegProcess !== proc) return;
-    console.log(`🔄 ffmpeg closed (${code}) — getting fresh URL...`);
-    ffmpegProcess = null;
-    global.isLive = false;
-    broadcast({ type: "status", live: false });
+  const entry = { ts: Date.now(), text, translations };
+  state.translations.unshift(entry);
+  if (state.translations.length > 20) state.translations.pop();
 
-    // Try Puppeteer first, fall back to same URL
-    const newUrl = await discoverHLSWithPuppeteer();
-    const urlToUse = newUrl || currentHLSUrl;
-    if (urlToUse) {
-      global.isLive = true;
-      broadcast({ type: "status", live: true });
-      setTimeout(() => startFFmpeg(dg, urlToUse), 3000);
+  broadcastSSE({ type: 'translation', ...entry });
+  broadcastToViewers(entry);
+}
+
+function broadcastToViewers(entry) {
+  const msg = JSON.stringify({ type: 'translation', ...entry });
+  wss.clients.forEach(client => {
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(msg);
+    }
+  });
+}
+
+function startFfmpeg(hlsUrl) {
+  if (ffmpegProc) {
+    log('info', 'Stopping existing ffmpeg process');
+    ffmpegProc.kill('SIGTERM');
+    ffmpegProc = null;
+  }
+
+  log('info', `Starting ffmpeg on: ${hlsUrl}`);
+  updateStatus('connecting');
+
+  const proc = spawn('ffmpeg', [
+    '-re',
+    '-i',       hlsUrl,
+    '-vn',                          // no video
+    '-acodec',  'pcm_s16le',
+    '-ar',      String(SAMPLE_RATE),
+    '-ac',      String(CHANNELS),
+    '-f',       's16le',            // raw PCM to stdout
+    '-',
+  ], { stdio: ['ignore', 'pipe', 'pipe'] });
+
+  ffmpegProc    = proc;
+  state.ffmpegPid = proc.pid;
+  pcmBuffer     = Buffer.alloc(0);
+
+  proc.stdout.on('data', data => {
+    if (state.status !== 'streaming') updateStatus('streaming');
+    pcmBuffer = Buffer.concat([pcmBuffer, data]);
+
+    // Drain complete chunks without awaiting (queue them)
+    while (pcmBuffer.length >= CHUNK_BYTES) {
+      const chunk = pcmBuffer.slice(0, CHUNK_BYTES);
+      pcmBuffer   = pcmBuffer.slice(CHUNK_BYTES);
+      if (!isProcessing) {
+        isProcessing = true;
+        processChunk(chunk).finally(() => { isProcessing = false; });
+      }
+    }
+  });
+
+  proc.stderr.on('data', d => {
+    const line = d.toString().trim();
+    // Only log meaningful ffmpeg lines (suppress verbose frame info)
+    if (/error|warn|failed|cannot|invalid/i.test(line)) {
+      log('warn', `ffmpeg: ${line.slice(0, 200)}`);
+    }
+  });
+
+  proc.on('close', code => {
+    state.ffmpegPid = null;
+    if (code !== 0 && code !== null) {
+      log('error', `ffmpeg exited with code ${code}, restarting in 10s…`);
+      state.errorCount++;
+      updateStatus('error');
+      setTimeout(() => startFfmpeg(state.hlsUrl), 10_000);
     } else {
-      const retry = setInterval(async () => {
-        const url = await discoverHLSWithPuppeteer();
-        if (url) {
-          clearInterval(retry);
-          global.isLive = true;
-          broadcast({ type: "status", live: true });
-          startFFmpeg(dg, url);
-        }
-      }, 30000);
+      log('info', 'ffmpeg process ended cleanly');
+      updateStatus('idle');
     }
   });
 
-  proc.on("error", async err => {
-    console.error("ffmpeg spawn error:", err.message);
-    ffmpegProcess = null;
-    // If ffmpeg not found, log clearly
-    if (err.code === "ENOENT") {
-      console.error("❌ ffmpeg not installed! Check Dockerfile.");
-    }
+  proc.on('error', err => {
+    log('error', `ffmpeg spawn error: ${err.message}`);
+    updateStatus('error');
   });
 }
 
-// ── Session Recording ─────────────────────────────────────────
-let currentSession = null;
-
-function startSession() {
-  const now = new Date();
-  const id = `session_${now.toISOString().replace(/[:.]/g,"-").slice(0,19)}`;
-  currentSession = {
-    id, startTime: now.toISOString(), endTime: null,
-    segments: [], srtIndex: 1,
-    paths: {
-      json: path.join(RECORDINGS_DIR, `${id}.json`),
-      csv:  path.join(RECORDINGS_DIR, `${id}.csv`),
-      srt:  path.join(RECORDINGS_DIR, `${id}.srt`),
-      txt:  path.join(RECORDINGS_DIR, `${id}_transcript.txt`)
-    }
-  };
-  const hdr = Object.keys(TARGET_LANGUAGES).map(c=>`"${TARGET_LANGUAGES[c]}"`).join(",");
-  fs.writeFileSync(currentSession.paths.csv, `"#","Timestamp","Duration","English",${hdr}\n`);
-  fs.writeFileSync(currentSession.paths.srt, "");
-  fs.writeFileSync(currentSession.paths.txt,
-    `Healing Streams Transcript\nSession: ${id}\nStarted: ${now.toLocaleString()}\n${"=".repeat(60)}\n\n`);
-  console.log(`📼 Session started: ${id}`);
-}
-
-function recordSegment(transcript, translations, t0, t1) {
-  if (!currentSession) return;
-  const seg = {
-    index: currentSession.segments.length + 1,
-    timestamp: t0.toISOString(), startTime: t0.toISOString(),
-    endTime: t1.toISOString(),
-    durationSeconds: ((t1 - t0)/1000).toFixed(1),
-    transcript, translations
-  };
-  currentSession.segments.push(seg);
-  fs.writeFileSync(currentSession.paths.json, JSON.stringify({
-    session: currentSession.id, startTime: currentSession.startTime,
-    totalSegments: currentSession.segments.length,
-    languages: Object.keys(TARGET_LANGUAGES),
-    segments: currentSession.segments
-  }, null, 2));
-  const vals = Object.keys(TARGET_LANGUAGES).map(c=>`"${(translations[c]||"").replace(/"/g,'""')}"`).join(",");
-  fs.appendFileSync(currentSession.paths.csv,
-    `${seg.index},"${seg.timestamp}","${seg.durationSeconds}s","${transcript.replace(/"/g,'""')}",${vals}\n`);
-  const s0 = fmtSRT(t0), s1 = fmtSRT(t1);
-  fs.appendFileSync(currentSession.paths.srt,
-    `${currentSession.srtIndex}\n${s0} --> ${s1}\n${transcript}\n\n`);
-  currentSession.srtIndex++;
-  fs.appendFileSync(currentSession.paths.txt, `[${t0.toLocaleTimeString()}]\n${transcript}\n\n`);
-  console.log(`📝 Segment #${seg.index}: "${transcript.substring(0,60)}"`);
-}
-
-function fmtSRT(d) {
-  return `${String(d.getHours()).padStart(2,"0")}:${String(d.getMinutes()).padStart(2,"0")}:${String(d.getSeconds()).padStart(2,"0")},${String(d.getMilliseconds()).padStart(3,"0")}`;
-}
-
-function endSession() {
-  if (!currentSession) return;
-  currentSession.endTime = new Date().toISOString();
-  fs.writeFileSync(currentSession.paths.json, JSON.stringify({
-    session: currentSession.id, startTime: currentSession.startTime,
-    endTime: currentSession.endTime,
-    totalSegments: currentSession.segments.length,
-    languages: Object.keys(TARGET_LANGUAGES),
-    segments: currentSession.segments
-  }, null, 2));
-  console.log(`📼 Session ended: ${currentSession.segments.length} segments`);
-  currentSession = null;
-}
-
-// ── Viewers ───────────────────────────────────────────────────
-const viewers = new Set();
-wss.on("connection", ws => {
-  viewers.add(ws);
-  console.log(`👁 Viewer connected. Total: ${viewers.size}`);
-  if (global.latestTranslation) ws.send(JSON.stringify({ type:"translation", ...global.latestTranslation }));
-  ws.send(JSON.stringify({ type:"status", live: global.isLive||false }));
-  ws.on("close", () => viewers.delete(ws));
-});
-
-function broadcast(data) {
-  const msg = JSON.stringify(data);
-  viewers.forEach(v => { if (v.readyState === WebSocket.OPEN) v.send(msg); });
-}
-
-// ── Translation ───────────────────────────────────────────────
-let pendingText = "", translationTimer = null, segmentStart = null;
-
-async function translateText(text, t0) {
-  const langStr = Object.entries(TARGET_LANGUAGES).map(([c,n])=>`${n} (${c})`).join(", ");
-  const msg = await anthropic.messages.create({
-    model: "claude-sonnet-4-20250514", max_tokens: 2000,
-    messages: [{ role: "user", content:
-      `You are a live ministry translation engine for a Christian healing program.
-Translate the following spoken English into: ${langStr}.
-Maintain spiritual tone. Respond ONLY with valid JSON. Keys = language codes, values = translations. No markdown.
-Text: "${text.replace(/"/g,'\\"')}"` }]
-  });
-  const raw = msg.content[0].text.replace(/```json|```/g,"").trim();
-  const translations = JSON.parse(raw);
-  recordSegment(text, translations, t0, new Date());
-  return translations;
-}
-
-function scheduleTranslation(transcript) {
-  if (!segmentStart) segmentStart = new Date();
-  pendingText += " " + transcript;
-  clearTimeout(translationTimer);
-  translationTimer = setTimeout(async () => {
-    const text = pendingText.trim(), t0 = segmentStart;
-    pendingText = ""; segmentStart = null;
-    if (!text) return;
-    try {
-      const translations = await translateText(text, t0);
-      const payload = { translations, transcript: text };
-      global.latestTranslation = payload;
-      broadcast({ type:"translation", ...payload });
-      console.log(`✅ Translated ${Object.keys(translations).length} languages`);
-    } catch(e) { console.error("Translation error:", e.message); }
-  }, 2500);
-}
-
-// ── Pipeline ──────────────────────────────────────────────────
+// ── Start the whole pipeline ──────────────────────────────────────
 async function startPipeline() {
-  console.log("🚀 Starting pipeline...");
-  global.isLive = false;
-  startSession();
-  if (dgConnection) { try { dgConnection.finish(); } catch(e) {} }
-
-  dgConnection = deepgram.listen.live({
-    model:"nova-2", language:"en-US",
-    smart_format:true, interim_results:true,
-    utterance_end_ms:2000,
-    endpointing:300,
-    vad_events:true,
-    keepalive:true
-});
-
-dgConnection.on(LiveTranscriptionEvents.Open, async () => {
-    console.log("✅ Deepgram connected");
-
-    // Keepalive to prevent timeout during silence/music
-    const keepAlive = setInterval(() => {
-      try {
-        if (dgConnection?.getReadyState() === 1) {
-          dgConnection.keepAlive();
-        } else { clearInterval(keepAlive); }
-      } catch(e) { clearInterval(keepAlive); }
-    }, 8000);
-
-    let hlsUrl = currentHLSUrl;
-    if (!hlsUrl) hlsUrl = await discoverHLSWithPuppeteer();
-    if (hlsUrl) {
-      global.isLive = true;
-      broadcast({ type:"status", live:true });
-      startFFmpeg(dgConnection, hlsUrl);
-    } else {
-      console.log("⚠️ No HLS URL — retrying in 60s");
-      setTimeout(async () => {
-        const url = await discoverHLSWithPuppeteer();
-        if (url) { global.isLive = true; broadcast({ type:"status", live:true }); startFFmpeg(dgConnection, url); }
-      }, 60000);
-    }
-  });
-
-  dgConnection.on(LiveTranscriptionEvents.Transcript, data => {
-    const alt = data.channel?.alternatives?.[0];
-    if (!alt?.transcript) return;
-    broadcast({ type:"transcript", text:alt.transcript, isFinal:data.is_final });
-    if (data.is_final && alt.transcript.trim().split(" ").length >= 5) scheduleTranslation(alt.transcript);
-  });
-
-  dgConnection.on(LiveTranscriptionEvents.Close, () => {
-    console.log("🔄 Deepgram closed — restarting in 5s...");
-    global.isLive = false;
-    endSession();
-    broadcast({ type:"status", live:false });
-    setTimeout(startPipeline, 5000);
-  });
-
-  dgConnection.on(LiveTranscriptionEvents.Error, e => console.error("Deepgram:", e.message||e));
+  try {
+    const hlsUrl = await discoverHlsUrl();
+    startFfmpeg(hlsUrl);
+  } catch (err) {
+    log('error', `Pipeline start failed: ${err.message}`);
+    state.errorCount++;
+    updateStatus('error');
+    log('info', 'Retrying discovery in 30s…');
+    setTimeout(startPipeline, 30_000);
+  }
 }
 
-// ── API ───────────────────────────────────────────────────────
-app.get("/", (req, res) => res.json({
-  status:"running", live: global.isLive||false,
-  viewers: viewers.size, recording: !!currentSession,
-  segments: currentSession?.segments.length||0,
-  hlsUrl: currentHLSUrl ? currentHLSUrl.substring(0,80)+"..." : "discovering..."
-}));
+// ── Express app ───────────────────────────────────────────────────
+app.use(express.json());
 
-app.post("/update-hls", (req, res) => {
-  const { url } = req.body;
-  if (!url) return res.status(400).json({ error:"url required" });
-  currentHLSUrl = url;
-  res.json({ success:true });
-  console.log("📡 Manual HLS update — restarting ffmpeg");
-  setTimeout(() => {
-    if (dgConnection) { global.isLive = true; broadcast({ type:"status", live:true }); startFFmpeg(dgConnection, url); }
-  }, 500);
-});
+// WebSocket upgrade tracking
+wss.on('connection', (ws, req) => {
+  state.clientCount++;
+  log('info', `Viewer connected. Total: ${state.clientCount}`);
+  broadcastSSE({ type: 'clients', count: state.clientCount });
 
-app.get("/discover-hls", async (req, res) => {
-  const url = await discoverHLSWithPuppeteer();
-  if (url && dgConnection) { global.isLive = true; broadcast({ type:"status", live:true }); startFFmpeg(dgConnection, url); }
-  res.json({ url: url||null, live: global.isLive||false });
-});
+  ws.send(JSON.stringify({
+    type:  'init',
+    langs: LANGUAGES,
+    last:  state.translations.slice(0, 3),
+  }));
 
-app.get("/admin", (req, res) => {
-  res.send(`<!DOCTYPE html>
-<html><head>
-<title>HS Translator Admin</title>
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<style>
-*{box-sizing:border-box;margin:0;padding:0}
-body{font-family:'Segoe UI',sans-serif;background:#0a0a1a;color:#fff;padding:24px;min-height:100vh}
-h1{color:#a78bfa;font-size:20px;margin-bottom:4px}
-.sub{color:rgba(255,255,255,.4);font-size:13px;margin-bottom:24px}
-.card{background:rgba(255,255,255,.05);border:1px solid rgba(124,58,237,.3);border-radius:14px;padding:20px;margin-bottom:16px}
-.card h3{font-size:13px;color:#c4b5fd;margin-bottom:12px}
-input{width:100%;background:rgba(0,0,0,.4);border:1px solid rgba(124,58,237,.4);color:#fff;border-radius:8px;padding:10px 12px;font-size:13px;margin-bottom:10px;outline:none}
-.btn{width:100%;background:linear-gradient(135deg,#7c3aed,#2563eb);color:#fff;border:none;border-radius:8px;padding:12px;font-size:14px;font-weight:700;cursor:pointer;margin-bottom:8px}
-.btn2{width:100%;background:rgba(255,255,255,.07);border:1px solid rgba(255,255,255,.15);color:rgba(255,255,255,.7);border-radius:8px;padding:10px;font-size:13px;cursor:pointer}
-.status{display:grid;grid-template-columns:1fr 1fr;gap:8px}
-.stat{background:rgba(0,0,0,.3);border-radius:8px;padding:12px;text-align:center}
-.stat-val{font-size:22px;font-weight:700;color:#a78bfa}
-.stat-lbl{font-size:10px;color:rgba(255,255,255,.4);margin-top:2px}
-.live-badge{display:inline-block;padding:3px 10px;border-radius:20px;font-size:12px;font-weight:700}
-.live-on{background:rgba(74,222,128,.15);color:#4ade80;border:1px solid rgba(74,222,128,.3)}
-.live-off{background:rgba(239,68,68,.15);color:#fca5a5;border:1px solid rgba(239,68,68,.3)}
-#msg{padding:10px;border-radius:8px;margin-top:8px;display:none;font-size:13px;text-align:center}
-.ok{background:rgba(74,222,128,.12);color:#4ade80;border:1px solid rgba(74,222,128,.25)}
-.err{background:rgba(239,68,68,.12);color:#fca5a5;border:1px solid rgba(239,68,68,.25)}
-.hls-url{word-break:break-all;font-size:11px;color:rgba(255,255,255,.4);margin-top:8px;padding:8px;background:rgba(0,0,0,.3);border-radius:6px}
-</style></head>
-<body>
-<h1>🎙 Healing Streams Translator</h1>
-<p class="sub">Admin Dashboard</p>
-<div class="card">
-  <h3>📊 Server Status</h3>
-  <div class="status">
-    <div class="stat"><div class="stat-val" id="sv">—</div><div class="stat-lbl">Viewers</div></div>
-    <div class="stat"><div class="stat-val" id="ss">—</div><div class="stat-lbl">Segments</div></div>
-  </div>
-  <div style="text-align:center;margin-top:10px"><span class="live-badge live-off" id="sl">Loading...</span></div>
-  <div class="hls-url" id="sh">—</div>
-</div>
-<div class="card">
-  <h3>🔍 Auto-Discover HLS URL</h3>
-  <p style="font-size:12px;color:rgba(255,255,255,.4);margin-bottom:12px">Opens healingstreams.tv and finds the stream URL automatically</p>
-  <button class="btn" onclick="discover()">🔍 Auto-Discover & Go Live</button>
-</div>
-<div class="card">
-  <h3>📋 Manual Update</h3>
-  <input type="text" id="url" placeholder="https://...chunks.m3u8">
-  <button class="btn" onclick="update()">⚡ Update & Go Live</button>
-  <div id="msg"></div>
-</div>
-<div class="card">
-  <h3>📥 Recordings</h3>
-  <button class="btn2" onclick="window.open('/recordings-list','_blank')">View All Recordings</button>
-</div>
-<script>
-async function discover(){showMsg('🔍 Opening healingstreams.tv... (30 sec)',true);try{const r=await fetch('/discover-hls');const d=await r.json();if(d.url){document.getElementById('url').value=d.url;showMsg('✅ Found & applied!',true);loadStatus();}else showMsg('❌ Not found. Try manual.',false);}catch(e){showMsg('❌ '+e.message,false);}}
-async function update(){const url=document.getElementById('url').value.trim();if(!url){showMsg('Paste URL first',false);return;}try{const r=await fetch('/update-hls',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url})});const d=await r.json();if(d.success){showMsg('✅ Updated! Restarting...',true);loadStatus();}else showMsg('❌ Failed',false);}catch(e){showMsg('❌ '+e.message,false);}}
-function showMsg(t,ok){const m=document.getElementById('msg');m.textContent=t;m.className=ok?'ok':'err';m.style.display='block';}
-async function loadStatus(){try{const d=await(await fetch('/')).json();document.getElementById('sv').textContent=d.viewers;document.getElementById('ss').textContent=d.segments;const sl=document.getElementById('sl');sl.textContent=d.live?'● LIVE':'○ Offline';sl.className='live-badge '+(d.live?'live-on':'live-off');document.getElementById('sh').textContent=d.hlsUrl||'Not configured';}catch(e){}}
-loadStatus();setInterval(loadStatus,5000);
-</script>
-</body></html>`);
-});
-
-app.get("/update-hls", (req, res) => res.redirect("/admin"));
-
-app.get("/recordings-list", (req, res) => {
-  const files = fs.readdirSync(RECORDINGS_DIR);
-  const sessions = {};
-  files.forEach(f => {
-    const base = f.replace(/\.(json|csv|srt|txt)$/, "").replace(/_transcript$/, "");
-    if (!sessions[base]) sessions[base] = { name:base, files:[] };
-    sessions[base].files.push({ name:f, url:`/recordings/${f}` });
+  ws.on('close', () => {
+    state.clientCount--;
+    broadcastSSE({ type: 'clients', count: state.clientCount });
   });
-  res.json(Object.values(sessions));
 });
 
-app.get("/current-session", (req, res) => {
-  if (!currentSession) return res.json({ active:false });
+// ── Admin SSE endpoint ────────────────────────────────────────────
+app.get('/admin/events', (req, res) => {
+  res.setHeader('Content-Type',  'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection',    'keep-alive');
+  res.flushHeaders();
+
+  // Send current state immediately
+  res.write(`data: ${JSON.stringify({
+    type: 'init',
+    status:      state.status,
+    hlsUrl:      state.hlsUrl,
+    clientCount: state.clientCount,
+    chunkCount:  state.chunkCount,
+    errorCount:  state.errorCount,
+    logs:        state.logs.slice(0, 50),
+    translations: state.translations.slice(0, 5),
+  })}\n\n`);
+
+  state.sseClients.add(res);
+  req.on('close', () => state.sseClients.delete(res));
+});
+
+// ── Admin REST endpoints ──────────────────────────────────────────
+app.get('/admin/status', (req, res) => {
   res.json({
-    active:true, id:currentSession.id,
-    startTime:currentSession.startTime,
-    segments:currentSession.segments.length,
-    downloads:{
-      json:`/recordings/${currentSession.id}.json`,
-      csv:`/recordings/${currentSession.id}.csv`,
-      srt:`/recordings/${currentSession.id}.srt`,
-      txt:`/recordings/${currentSession.id}_transcript.txt`
-    }
+    status:      state.status,
+    hlsUrl:      state.hlsUrl,
+    ffmpegPid:   state.ffmpegPid,
+    clientCount: state.clientCount,
+    chunkCount:  state.chunkCount,
+    errorCount:  state.errorCount,
+    lastChunkAt: state.lastChunkAt,
+    lastTranscript: state.lastTranscript,
   });
 });
 
-app.get("/embed.js", (req, res) => {
-  res.setHeader("Content-Type","application/javascript");
-  res.sendFile(path.join(__dirname,"translator-embed.js"));
+app.post('/admin/start', async (req, res) => {
+  if (state.status === 'streaming' || state.status === 'connecting') {
+    return res.json({ ok: false, msg: 'Already running' });
+  }
+  res.json({ ok: true, msg: 'Starting pipeline…' });
+  startPipeline();
 });
 
-server.listen(PORT, () => {
-  console.log(`\n🌐 Healing Streams Translation Server — Port ${PORT}`);
-  console.log(`📺 Stream: ${STREAM_PAGE}\n`);
+app.post('/admin/stop', (req, res) => {
+  if (ffmpegProc) {
+    ffmpegProc.kill('SIGTERM');
+    ffmpegProc = null;
+  }
+  updateStatus('idle');
+  res.json({ ok: true, msg: 'Pipeline stopped' });
+});
+
+app.post('/admin/rediscover', async (req, res) => {
+  state.hlsUrl = HLS_URL_OVERRIDE || null; // clear cache
+  res.json({ ok: true, msg: 'Re-discovering HLS URL…' });
+  if (ffmpegProc) { ffmpegProc.kill('SIGTERM'); ffmpegProc = null; }
   startPipeline();
+});
+
+// ── Admin HTML page ───────────────────────────────────────────────
+app.get('/admin', (req, res) => {
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  res.send(`<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>HS Translator — Admin</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0f1117;color:#e2e8f0;min-height:100vh}
+  header{background:#1a1d2e;border-bottom:1px solid #2d3148;padding:16px 24px;display:flex;align-items:center;gap:12px}
+  header h1{font-size:18px;font-weight:600;color:#fff}
+  header .tag{font-size:11px;background:#6366f1;color:#fff;padding:2px 8px;border-radius:4px}
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;padding:24px;max-width:1200px}
+  @media(max-width:768px){.grid{grid-template-columns:1fr}}
+  .card{background:#1a1d2e;border:1px solid #2d3148;border-radius:10px;padding:20px}
+  .card h2{font-size:13px;text-transform:uppercase;letter-spacing:.06em;color:#94a3b8;margin-bottom:14px}
+  .status-badge{display:inline-flex;align-items:center;gap:6px;padding:4px 12px;border-radius:20px;font-size:13px;font-weight:500}
+  .s-idle{background:#1e293b;color:#94a3b8}
+  .s-discovering,.s-connecting{background:#312e1a;color:#fbbf24}
+  .s-streaming{background:#0f2e1e;color:#34d399}
+  .s-error{background:#2e1014;color:#f87171}
+  .dot{width:7px;height:7px;border-radius:50%;background:currentColor}
+  .dot.pulse{animation:pulse 1.4s infinite}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+  .stat-row{display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid #1e2340;font-size:14px}
+  .stat-row:last-child{border:none}
+  .stat-val{color:#fff;font-weight:500;font-variant-numeric:tabular-nums}
+  .url-box{font-size:12px;color:#7c83a0;word-break:break-all;margin-top:8px;padding:8px;background:#0f1117;border-radius:6px;min-height:28px}
+  .btn{padding:8px 16px;border:none;border-radius:6px;font-size:13px;font-weight:500;cursor:pointer;transition:opacity .15s}
+  .btn:hover{opacity:.8}
+  .btn-green{background:#059669;color:#fff}
+  .btn-red{background:#dc2626;color:#fff}
+  .btn-blue{background:#2563eb;color:#fff}
+  .btn-row{display:flex;gap:8px;flex-wrap:wrap;margin-top:14px}
+  .log-list{list-style:none;height:260px;overflow-y:auto;font-size:12px;font-family:monospace}
+  .log-list li{padding:3px 0;border-bottom:1px solid #1a1d2e;display:flex;gap:8px;line-height:1.5}
+  .log-list li .ts{color:#4a5568;white-space:nowrap;flex-shrink:0}
+  .log-list .info{color:#93c5fd}
+  .log-list .warn{color:#fcd34d}
+  .log-list .error{color:#fca5a5}
+  .trans-list{list-style:none;max-height:300px;overflow-y:auto}
+  .trans-item{padding:10px 0;border-bottom:1px solid #1e2340}
+  .trans-item .orig{font-size:14px;color:#e2e8f0;margin-bottom:6px}
+  .trans-item .langs{display:flex;flex-wrap:wrap;gap:6px}
+  .trans-item .lang-pill{font-size:11px;background:#1e2340;border-radius:4px;padding:2px 6px;color:#94a3b8}
+  .trans-item .lang-pill strong{color:#c4b5fd}
+  .last-tx{font-size:13px;color:#d1d5db;padding:10px;background:#0f1117;border-radius:6px;min-height:44px;line-height:1.6}
+  .full-width{grid-column:1/-1}
+</style>
+</head>
+<body>
+<header>
+  <h1>HS Translator</h1>
+  <span class="tag">Admin</span>
+  <span id="status-badge" class="status-badge s-idle"><span class="dot"></span> idle</span>
+</header>
+
+<div class="grid">
+  <div class="card">
+    <h2>Stream</h2>
+    <div class="stat-row"><span>Viewers</span><span class="stat-val" id="clients">0</span></div>
+    <div class="stat-row"><span>Chunks processed</span><span class="stat-val" id="chunks">0</span></div>
+    <div class="stat-row"><span>Errors</span><span class="stat-val" id="errors">0</span></div>
+    <div class="stat-row"><span>Last chunk</span><span class="stat-val" id="last-chunk">—</span></div>
+    <div style="margin-top:10px;font-size:12px;color:#64748b">HLS URL</div>
+    <div class="url-box" id="hls-url">—</div>
+    <div class="btn-row">
+      <button class="btn btn-green" onclick="api('start')">▶ Start</button>
+      <button class="btn btn-red"   onclick="api('stop')">■ Stop</button>
+      <button class="btn btn-blue"  onclick="api('rediscover')">⟳ Re-discover</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Last transcript</h2>
+    <div class="last-tx" id="last-tx">Waiting for audio…</div>
+  </div>
+
+  <div class="card full-width">
+    <h2>Recent translations</h2>
+    <ul class="trans-list" id="trans-list"><li style="color:#4a5568;font-size:13px;padding:8px 0">No translations yet</li></ul>
+  </div>
+
+  <div class="card full-width">
+    <h2>Log</h2>
+    <ul class="log-list" id="log-list"></ul>
+  </div>
+</div>
+
+<script>
+const badge   = document.getElementById('status-badge');
+const hlsEl   = document.getElementById('hls-url');
+const clientEl = document.getElementById('clients');
+const chunkEl  = document.getElementById('chunks');
+const errEl    = document.getElementById('errors');
+const lastChEl = document.getElementById('last-chunk');
+const lastTxEl = document.getElementById('last-tx');
+const transList = document.getElementById('trans-list');
+const logList   = document.getElementById('log-list');
+
+const STATUS_CLASS = {
+  idle:'s-idle', discovering:'s-discovering', connecting:'s-connecting',
+  streaming:'s-streaming', error:'s-error'
+};
+
+function setStatus(s) {
+  badge.className = 'status-badge ' + (STATUS_CLASS[s] || 's-idle');
+  badge.innerHTML = '<span class="dot' + (s==='streaming'?' pulse':'') + '"></span> ' + s;
+}
+
+function renderLog(entry) {
+  const li = document.createElement('li');
+  const t = entry.t ? entry.t.slice(11,19) : '';
+  li.innerHTML = '<span class="ts">' + t + '</span><span class="' + (entry.level||'info') + '">' + escH(entry.msg) + '</span>';
+  logList.insertBefore(li, logList.firstChild);
+  while (logList.children.length > 100) logList.removeChild(logList.lastChild);
+}
+
+function renderTranslation(entry) {
+  if (transList.children.length === 1 && transList.children[0].tagName === 'LI' && transList.children[0].style.color) {
+    transList.innerHTML = '';
+  }
+  const li = document.createElement('li');
+  li.className = 'trans-item';
+  const pills = Object.entries(entry.translations || {}).slice(0, 8)
+    .map(([k,v]) => '<span class="lang-pill"><strong>' + k + '</strong> ' + escH(v.slice(0,40)) + '</span>')
+    .join('');
+  li.innerHTML = '<div class="orig">' + escH(entry.text) + '</div><div class="langs">' + pills + '</div>';
+  transList.insertBefore(li, transList.firstChild);
+  while (transList.children.length > 10) transList.removeChild(transList.lastChild);
+  lastTxEl.textContent = entry.text;
+}
+
+function escH(s) { return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+function api(action) {
+  fetch('/admin/' + action, { method: 'POST' })
+    .then(r => r.json()).then(d => console.log(d));
+}
+
+// SSE connection
+const es = new EventSource('/admin/events');
+es.onmessage = e => {
+  const d = JSON.parse(e.data);
+  if (d.type === 'init') {
+    setStatus(d.status);
+    hlsEl.textContent = d.hlsUrl || '—';
+    clientEl.textContent = d.clientCount;
+    chunkEl.textContent  = d.chunkCount;
+    errEl.textContent    = d.errorCount;
+    (d.logs || []).reverse().forEach(renderLog);
+    (d.translations || []).reverse().forEach(renderTranslation);
+  } else if (d.type === 'status') {
+    setStatus(d.status);
+    if (d.hlsUrl) hlsEl.textContent = d.hlsUrl;
+  } else if (d.type === 'log') {
+    renderLog(d);
+  } else if (d.type === 'translation') {
+    chunkEl.textContent = parseInt(chunkEl.textContent||0) + 1;
+    lastChEl.textContent = new Date().toLocaleTimeString();
+    renderTranslation(d);
+  } else if (d.type === 'clients') {
+    clientEl.textContent = d.count;
+  }
+};
+es.onerror = () => console.warn('SSE connection dropped, will reconnect…');
+</script>
+</body>
+</html>`);
+});
+
+// ── Health check ──────────────────────────────────────────────────
+app.get('/health', (req, res) => {
+  res.json({ ok: true, status: state.status, clients: state.clientCount });
+});
+
+// ── Viewer embed snippet ──────────────────────────────────────────
+app.get('/embed.js', (req, res) => {
+  const host = `wss://${req.headers.host}`;
+  res.setHeader('Content-Type', 'application/javascript');
+  res.send(`
+(function(){
+  var LANGS=${JSON.stringify(LANGUAGES)};
+  var ws=null;var sel='en';
+  function connect(){
+    ws=new WebSocket('${host}');
+    ws.onopen=function(){console.log('[HS Translator] connected')};
+    ws.onmessage=function(e){
+      var d=JSON.parse(e.data);
+      if(d.type==='translation'){
+        var t=d.translations[sel]||d.text;
+        var el=document.getElementById('hs-translation');
+        if(el) el.textContent=t;
+        document.dispatchEvent(new CustomEvent('hs-translation',{detail:{text:t,lang:sel,all:d}}));
+      }
+    };
+    ws.onclose=function(){setTimeout(connect,5000)};
+  }
+  connect();
+  window.HSTranslator={setLang:function(l){sel=l},langs:LANGS};
+})();
+  `);
+});
+
+// ── Start server ──────────────────────────────────────────────────
+server.listen(PORT, () => {
+  log('info', `Server listening on port ${PORT}`);
+  log('info', `Admin UI: http://localhost:${PORT}/admin`);
+  // Auto-start pipeline
+  startPipeline();
+});
+
+process.on('SIGTERM', () => {
+  log('info', 'SIGTERM received, shutting down');
+  if (ffmpegProc) ffmpegProc.kill('SIGTERM');
+  server.close(() => process.exit(0));
 });
